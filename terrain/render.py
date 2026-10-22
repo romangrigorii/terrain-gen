@@ -33,11 +33,13 @@ def _rank(vals, pool, n=20000):
     return np.searchsorted(s, vals, side="right") / len(s)
 
 
-def _cell_noise(shape, seed):
-    """Stable value in -1..1 for each cell. Smooth it before using it as an edge."""
+def _cell_noise(shape, seed, origin=(0, 0)):
+    """Stable value in -1..1 for each cell. `origin` is the global cell of local (0, 0)."""
     y, x = np.indices(shape)
-    n = (y.astype(np.int64) * np.int64(374761393)
-         + x.astype(np.int64) * np.int64(668265263)
+    y = y.astype(np.int64) + np.int64(origin[0])
+    x = x.astype(np.int64) + np.int64(origin[1])
+    n = (y * np.int64(374761393)
+         + x * np.int64(668265263)
          + np.int64(seed)) & np.int64(0xFFFFFFFF)
     n ^= n >> np.int64(13)
     n = (n * np.int64(1274126177)) & np.int64(0xFFFFFFFF)
@@ -49,16 +51,16 @@ def _smoother(t):
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
 
-def _sway(shape, seed, smooth=1.8):
+def _sway(shape, seed, smooth=1.8, origin=(0, 0)):
     """Smooth noise brought back to about -1..1. Blur alone would flatten it."""
-    field = grid.blur(_cell_noise(shape, int(seed)), float(smooth))
+    field = grid.blur(_cell_noise(shape, int(seed), origin), float(smooth))
     scale = float(np.percentile(np.abs(field), 90))
     if scale < 1e-6:
         return field
     return np.clip(field / np.float32(scale), -1.0, 1.0).astype(np.float32)
 
 
-def _shore_mix(h, seed=11, reach=3.4):
+def _shore_mix(h, seed=11, reach=3.4, origin=(0, 0)):
     """1 inland, 0 at sea. The join wanders, so the shore is not a cell staircase.
 
     The shared rim keeps the hard cut. A neighbor tile paints that same pixel.
@@ -66,7 +68,7 @@ def _shore_mix(h, seed=11, reach=3.4):
     h = np.asarray(h, np.float64)
     gy, gx = grid.gradient(h)
     slope = np.maximum(np.hypot(gy, gx), 1e-6)
-    shifted = h + _sway(h.shape, seed) * slope * float(reach)
+    shifted = h + _sway(h.shape, seed, origin=origin) * slope * float(reach)
     mix = _smoother(shifted / (slope * 1.35) + 0.5).astype(np.float32)
     hard = (h > 0.0).astype(np.float32)
     mix[0, :] = hard[0, :]
@@ -76,7 +78,7 @@ def _shore_mix(h, seed=11, reach=3.4):
     return mix
 
 
-def _fray_labels(ids, seed, reach=4.5):
+def _fray_labels(ids, seed, reach=4.5, origin=(0, 0)):
     """Move a colour boundary off the grid. Cells far from a border stay put."""
     ids = np.asarray(ids)
     edge = np.zeros(ids.shape, dtype=bool)
@@ -90,8 +92,8 @@ def _fray_labels(ids, seed, reach=4.5):
     rows, cols = ids.shape
     yy = np.arange(rows, dtype=np.float32)[:, None]
     xx = np.arange(cols, dtype=np.float32)[None, :]
-    sway_y = _sway(ids.shape, seed, smooth=2.4)
-    sway_x = _sway(ids.shape, seed + 29, smooth=2.4)
+    sway_y = _sway(ids.shape, seed, smooth=2.4, origin=origin)
+    sway_x = _sway(ids.shape, seed + 29, smooth=2.4, origin=origin)
     sy = np.clip(np.rint(yy + sway_y * float(reach) * fade), 0, rows - 1).astype(np.int32)
     sx = np.mod(np.rint(xx + sway_x * float(reach) * fade).astype(np.int32), cols)
     picked = ids[sy, sx]
@@ -105,30 +107,48 @@ def _fray_labels(ids, seed, reach=4.5):
     return out
 
 
-def _ragged_cover(mask, seed, reach=3.2, sigma=0.85):
+def _ragged_cover(mask, seed, reach=3.2, sigma=0.85, origin=(0, 0)):
     """Warp a binary mask so its outline is a curve, then soften that curve."""
     mask = np.asarray(mask, np.float32)
     rows, cols = mask.shape
     yy = np.arange(rows, dtype=np.float32)[:, None]
     xx = np.arange(cols, dtype=np.float32)[None, :]
-    sy = np.clip(np.rint(yy + _sway(mask.shape, seed) * float(reach)), 0, rows - 1).astype(np.int32)
-    sx = np.mod(np.rint(xx + _sway(mask.shape, int(seed) + 17) * float(reach)).astype(np.int32), cols)
+    sy = np.clip(np.rint(yy + _sway(mask.shape, seed, origin=origin) * float(reach)), 0, rows - 1).astype(np.int32)
+    sx = np.mod(np.rint(xx + _sway(mask.shape, int(seed) + 17, origin=origin) * float(reach)).astype(np.int32), cols)
     warped = mask[sy, sx]
     if sigma <= 0:
         return warped
     return grid.blur(warped, float(sigma))
 
 
-def hypsometric(h, land_mix=0.35, sea_mix=0.22):
-    """Blue below sea level, green-to-white above, each side scaled separately."""
+def color_stats(h):
+    """Land and sea scales for one height field. Reuse them for every tile of that field."""
+    h = np.asarray(h, np.float64)
     land_v, sea_v = h[h > 0], h[h < 0]
     sea_scale = max(1e-6, -float(np.percentile(sea_v, 2)) if sea_v.size else 1.0)
     land_scale = max(1e-6, float(np.percentile(land_v, 98)) if land_v.size else 1.0)
+    return {"land": land_v, "sea": sea_v, "land_scale": land_scale, "sea_scale": sea_scale}
+
+
+def _view_origin(world):
+    origin = getattr(world, "tile_origin", None)
+    if not origin:
+        return (0, 0)
+    return int(origin[0]), int(origin[1])
+
+
+def hypsometric(h, land_mix=0.35, sea_mix=0.22, stats=None, origin=(0, 0)):
+    """Blue below sea level, green-to-white above, each side scaled separately."""
+    if stats is None:
+        stats = color_stats(h)
+    land_v, sea_v = stats["land"], stats["sea"]
+    sea_scale = float(stats["sea_scale"])
+    land_scale = float(stats["land_scale"])
     sea = _ramp((1 - sea_mix) * np.clip(h / sea_scale, -1, 0) -
                 sea_mix * (1 - _rank(h, sea_v)), SEA_RAMP)
     land = _ramp((1 - land_mix) * np.clip(h / land_scale, 0, 1) +
                  land_mix * _rank(h, land_v), LAND_RAMP)
-    mix = _shore_mix(h)[..., None]
+    mix = _shore_mix(h, origin=origin)[..., None]
     return sea * (1.0 - mix) + land * mix
 
 
@@ -143,10 +163,10 @@ def hillshade(h, azimuth=315.0, altitude=45.0, z=28.0):
     return np.clip(shade, 0, 1)
 
 
-def relief(h, shade=True, surface=None, tint=None, tint_mix=0.0):
+def relief(h, shade=True, surface=None, tint=None, tint_mix=0.0, stats=None, origin=(0, 0)):
     """Hypsometric tint of the bed, hillshaded off `surface` if water sits on it."""
-    rgb = hypsometric(h)
-    shore = _shore_mix(h)[..., None]
+    rgb = hypsometric(h, stats=stats, origin=origin)
+    shore = _shore_mix(h, origin=origin)[..., None]
     if tint is not None and tint_mix > 0:
         gain = float(tint_mix) * shore
         rgb = rgb * (1.0 - gain) + tint * gain
@@ -161,19 +181,19 @@ LAKE_DEPTH_BLUR = 2.0   # softens the drowned channel out of the depth shading
 RIVER_RAMP = [(0.0, (110, 165, 195)), (0.4, (78, 132, 176)), (1.0, (48, 96, 150))]
 
 
-def overpaint_water(rgb, w):
+def overpaint_water(rgb, w, origin=(0, 0)):
     """Lay lakes and rivers over whatever the land was painted with."""
     wat = w.water
     if wat.lake_mask.any():
         soft = grid.blur(wat.lake_depth, LAKE_DEPTH_BLUR)
         d = np.clip(soft / max(1e-6, float(np.percentile(
             soft[wat.lake_mask], 92))), 0, 1)
-        cover = _ragged_cover(wat.lake_mask, seed=int(w.cfg.seed) + 23)[..., None]
+        cover = _ragged_cover(wat.lake_mask, seed=int(w.cfg.seed) + 23, origin=origin)[..., None]
         rgb = rgb * (1.0 - cover) + _ramp(d, LAKE_RAMP) * cover
     if wat.river_mask.any():
         v = np.clip(wat.width / max(1e-6, w.cfg.river_width_max), 0, 1)
         cover = _ragged_cover(wat.river_mask, seed=int(w.cfg.seed) + 47,
-                              reach=1.4, sigma=0.65)[..., None]
+                              reach=1.4, sigma=0.65, origin=origin)[..., None]
         rgb = rgb * (1.0 - cover) + _ramp(v, RIVER_RAMP) * cover
     return rgb
 
@@ -200,10 +220,13 @@ def tint_placed(rgb, world):
 
 def water_map(w, shade=True, tint_mix=None):
     """The main view: relief with lakes at their own flat level and rivers by width."""
+    origin = _view_origin(w)
+    stats = getattr(w, "color_stats", None)
     rgb = relief(w.height, shade, surface=w.surface, tint=biome_rgb(w),
-                 tint_mix=w.cfg.biome_tint if tint_mix is None else tint_mix)
+                 tint_mix=w.cfg.biome_tint if tint_mix is None else tint_mix,
+                 stats=stats, origin=origin)
     rgb = paint_trees(rgb, w.trees, w.height.shape, w.cfg.tree_relief)
-    rgb = tint_placed(overpaint_water(rgb, w), w)
+    rgb = tint_placed(overpaint_water(rgb, w, origin), w)
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
@@ -293,23 +316,26 @@ BIOME_COLORS = np.array([
 
 def biome_rgb(w, soften=None):
     """Biome colour. Borders wander off the cell grid; sea stays for the ramp."""
+    origin = _view_origin(w)
     land_ids = np.where(w.land, w.biome, 0)
-    rgb = BIOME_COLORS[_fray_labels(land_ids, seed=int(w.cfg.seed) + 41)]
+    rgb = BIOME_COLORS[_fray_labels(land_ids, seed=int(w.cfg.seed) + 41, origin=origin)]
     s = w.cfg.biome_soften if soften is None else soften
     if s <= 0:
         return rgb
-    m = _shore_mix(w.height, seed=int(w.cfg.seed) + 7)
+    m = _shore_mix(w.height, seed=int(w.cfg.seed) + 7, origin=origin)
     num = np.stack([grid.blur(rgb[..., c] * m, s) for c in range(3)], axis=-1)
     return num / np.maximum(grid.blur(m, s), 1e-6)[..., None]
 
 
 def biome_map(w):
     """Flat biome colour, hillshaded, with the water drawn back over it."""
+    origin = _view_origin(w)
+    stats = getattr(w, "color_stats", None)
     rgb = biome_rgb(w)
-    shore = _shore_mix(w.height, seed=int(w.cfg.seed) + 7)[..., None]
+    shore = _shore_mix(w.height, seed=int(w.cfg.seed) + 7, origin=origin)[..., None]
     lit = rgb * (0.78 + 0.38 * hillshade(w.height)[..., None])
-    rgb = hypsometric(w.height) * (1.0 - shore) + lit * shore
-    return np.clip(overpaint_water(rgb, w), 0, 255).astype(np.uint8)
+    rgb = hypsometric(w.height, stats=stats, origin=origin) * (1.0 - shore) + lit * shore
+    return np.clip(overpaint_water(rgb, w, origin), 0, 255).astype(np.uint8)
 
 LEGEND_COLORS = np.array([
     (37, 86, 134),      # ocean, only ever a placeholder
@@ -425,12 +451,14 @@ def biome_edges(w):
 
 def legend_biome_map(w):
     """One colour per biome, with a ragged join, and a key to read them by."""
+    origin = _view_origin(w)
+    stats = getattr(w, "color_stats", None)
     land_ids = np.where(w.land, w.biome, 0)
-    colours = LEGEND_COLORS[_fray_labels(land_ids, seed=int(w.cfg.seed) + 41)]
+    colours = LEGEND_COLORS[_fray_labels(land_ids, seed=int(w.cfg.seed) + 41, origin=origin)]
     lit = colours * (0.86 + 0.24 * hillshade(w.height)[..., None])
-    shore = _shore_mix(w.height, seed=int(w.cfg.seed) + 7)[..., None]
-    rgb = hypsometric(w.height) * (1.0 - shore) + lit * shore
-    rgb = overpaint_water(rgb, w)
+    shore = _shore_mix(w.height, seed=int(w.cfg.seed) + 7, origin=origin)[..., None]
+    rgb = hypsometric(w.height, stats=stats, origin=origin) * (1.0 - shore) + lit * shore
+    rgb = overpaint_water(rgb, w, origin)
     return draw_legend(np.clip(rgb, 0, 255), present_biomes(w), w.land).astype(np.uint8)
 
 TEMP_RAMP = [(-30.0, (78, 96, 168)), (-10.0, (120, 168, 208)),

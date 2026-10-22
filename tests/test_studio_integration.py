@@ -209,6 +209,66 @@ def test_gui_export_worker_writes_advanced_outputs(monkeypatch, tmp_path):
     assert (advanced / "flow_vectors.npz").exists()
 
 
+def test_export_writes_into_the_folder_the_user_picked(monkeypatch, tmp_path):
+    gui = _mock_gui(monkeypatch)
+    monkeypatch.setattr(gui, "LIBRARY_TERRAIN", tmp_path / "library" / "terrain")
+    monkeypatch.setattr(gui, "BUNDLE_PARENT", tmp_path / "export")
+    chosen = tmp_path / "picked"
+    chosen.mkdir()
+    seen = {}
+
+    def write_direct(height, mask, flow, w, h, seed, folder, **kwargs):
+        seen["hires"] = Path(folder)
+        Path(folder).mkdir(parents=True, exist_ok=True)
+
+    def write_game(made, library_dir, world=None):
+        seen["game"] = Path(library_dir)
+        Path(library_dir).mkdir(parents=True, exist_ok=True)
+        return Path(library_dir)
+
+    def bundle(world, parent="out/export", d=None, advanced=False):
+        seen["bundle"] = Path(parent)
+        out = Path(parent) / "seed3"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    monkeypatch.setattr(gui.hires, "write_direct", write_direct)
+    monkeypatch.setattr(gui, "write_game_copy", write_game)
+    monkeypatch.setattr(gui.export, "bundle", bundle)
+    blank = np.zeros((8, 8, 3), np.uint8)
+    world = types.SimpleNamespace(
+        height=np.zeros((8, 8), np.float32),
+        cfg=types.SimpleNamespace(
+            erosion_model="none", terrain_model="classic", wind_mode="belts",
+            depression_method="iterative", noise_backend="numpy",
+            world_width_m=1000.0, seed=3,
+        ),
+    )
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.events = queue.Queue()
+    studio.world = world
+    studio.made = {
+        "world": blank, "height": blank, "biomes": blank,
+        "material mask": blank, "flow": blank, "canopy": blank,
+        "_mask": np.zeros((8, 8, 4), np.uint8),
+    }
+    studio.tx = 0
+    studio.ty = 0
+    studio.atlas = {}
+    settings = dict(preset="earthlike", seed=3, detail_level="off",
+                    detail_mode="noise", advanced_export=False)
+    studio._export_worker(64, settings, False, chosen)
+    events = []
+    while not studio.events.empty():
+        events.append(studio.events.get_nowait())
+    errors = [ev[1] for ev in events if ev[0] == "error"]
+    assert not errors, errors
+    assert seen["hires"].is_relative_to(chosen / "hires")
+    assert seen["game"] == chosen
+    assert seen["bundle"] == chosen
+    assert not (tmp_path / "library").exists()
+
+
 def test_neighbor_atlas_exports_have_continuous_height(tmp_path):
     left = np.broadcast_to(np.linspace(0, 1, 32, dtype=np.float32), (24, 32)).copy()
     right = np.broadcast_to(np.linspace(1, 2, 32, dtype=np.float32), (24, 32)).copy()
@@ -289,13 +349,19 @@ def test_panning_onto_an_empty_tile_does_not_generate(monkeypatch):
     studio.atlas = {(0, 0): {}}
     studio.image_name = ""
     studio.tx, studio.ty = 0, 0
+    studio.seed = 7
+    studio.seed_text = "7"
+    studio.preset_dirty = False
     studio._cell_under_center = lambda: (1, 0)
+    studio._random_seed = lambda: 333
     started = []
     studio.start = lambda: started.append(True)
     studio._release_map()
     assert started == []
     assert (studio.tx, studio.ty) == (1, 0)
     assert studio._seed_from == (0, 0)
+    assert studio.seed == 333
+    assert studio.seed_text == "333"
     assert "Generate preview" in studio.status
 
 
@@ -322,13 +388,99 @@ def test_arrow_to_an_empty_tile_does_not_generate(monkeypatch):
     studio.busy = False
     studio.atlas = {(0, 0): {}}
     studio.tx, studio.ty = 0, 0
+    studio.seed = 7
+    studio.seed_text = "7"
+    studio.preset_dirty = False
     studio.fit = lambda: None
+    studio._random_seed = lambda: 111
     started = []
     studio.start = lambda: started.append(True)
     studio._step(1, 0)
     assert started == []
     assert (studio.tx, studio.ty) == (1, 0)
+    assert studio.seed == 111
+    assert studio.seed_text == "111"
+    assert studio.preset_dirty
     assert "Generate preview" in studio.status
+
+
+def test_each_empty_tile_gets_its_own_seed(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.busy = False
+    studio.atlas = {(0, 0): {}}
+    studio.tx, studio.ty = 0, 0
+    studio.seed = 7
+    studio.seed_text = "7"
+    studio.preset_dirty = True
+    studio.fit = lambda: None
+    rolls = iter([111, 222])
+    studio._random_seed = lambda: next(rolls)
+    studio._step(1, 0)
+    assert studio.seed == 111 and studio.seed_text == "111"
+    studio._step(1, 0)
+    assert (studio.tx, studio.ty) == (2, 0)
+    assert studio.seed == 222 and studio.seed_text == "222"
+
+
+def test_a_seed_chosen_for_this_tile_is_kept(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.atlas = {(0, 0): {"settings": {"seed": 7}}}
+    studio._seed_from = (0, 0)
+    studio.preset_dirty = True
+    studio.seed = 42
+    studio.seed_text = "42"
+    studio.settings = lambda: {"seed": studio.seed}
+    studio._random_seed = lambda: 999
+    assert studio._preset_for(1, 0)["seed"] == 42
+
+
+def test_arrow_to_a_built_tile_keeps_its_seed(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.busy = False
+    studio.atlas = {(0, 0): {}, (1, 0): {}}
+    studio.tx, studio.ty = 0, 0
+    studio.seed = 7
+    studio.seed_text = "7"
+    studio.fit = lambda: None
+    shown = []
+    studio._show_cell = lambda tx, ty, fit=True: shown.append((tx, ty, fit))
+    studio._random_seed = lambda: 999
+    studio._step(1, 0)
+    assert shown == [(1, 0, True)]
+    assert studio.seed == 7
+
+
+def test_panning_inside_an_empty_tile_keeps_the_seed(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.busy = False
+    studio.atlas = {(0, 0): {}}
+    studio.image_name = ""
+    studio.tx, studio.ty = 1, 0
+    studio.seed = 111
+    studio.seed_text = "111"
+    studio.preset_dirty = True
+    studio._cell_under_center = lambda: (1, 0)
+    studio._random_seed = lambda: 222
+    studio._release_map()
+    assert studio.seed == 111
+    assert (studio.tx, studio.ty) == (1, 0)
+
+
+def test_randomize_seed_fills_the_box(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.seed = 7
+    studio.seed_text = "7"
+    studio.preset_dirty = False
+    studio._random_seed = lambda: 4242
+    studio.randomize_seed()
+    assert studio.seed == 4242
+    assert studio.seed_text == "4242"
+    assert studio.preset_dirty
 
 
 def _running_preview(gui):

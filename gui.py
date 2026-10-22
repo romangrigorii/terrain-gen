@@ -1,7 +1,10 @@
 """Asset studio for the terrain generator."""
+import json
 import math
 import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -15,7 +18,7 @@ from terrain import Config, climate, export, generate, grid, render
 from terrain.elevation import paint_relief, sculpt_grain
 from terrain.presets import PRESETS, make_config
 from terrain.view3d import load_surface, mark_strokes, pan_delta, stitch_tiles
-from terrain.world import meet_border
+from terrain.world import apply_border
 
 ASSETS = Path(os.environ.get("TERRAIN_ASSETS_ROOT", Path(__file__).resolve().parent / "out"))
 LIBRARY_TERRAIN = ASSETS / "library" / "terrain"
@@ -73,6 +76,34 @@ KIND_NAME = {
     "coast": "coast",
     "cave": "caves",
 }
+
+
+def latest_pointer():
+    """The studio's note of the newest export, kept beside the export folder."""
+    return BUNDLE_PARENT.parent / "latest.json"
+
+
+def read_latest(path):
+    """Bundle and hi-res folders recorded by the last successful export."""
+    path = Path(path)
+    if not path.is_file():
+        return None, None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    bundle, hires = data.get("bundle"), data.get("hires")
+    return (str(bundle) if bundle else None, str(hires) if hires else None)
+
+
+def embellish_command(bundle=None, hires=None):
+    """Launch the embellish editor, preferring the hi-res export when it exists."""
+    script = Path(__file__).resolve().parent / "edit_gui.py"
+    command = [sys.executable, str(script)]
+    target = hires or bundle
+    if target:
+        command.append(str(target))
+    return command
 
 
 def config_from_settings(settings, width, height):
@@ -369,7 +400,7 @@ def _border_from(edges):
     """Neighbor samples the generator pins, keyed by side."""
     if not edges:
         return None
-    return {
+    border = {
         edge["side"]: {
             "edge": edge["height"],
             "outer": edge["outer"],
@@ -378,6 +409,10 @@ def _border_from(edges):
         }
         for edge in edges
     }
+    levels = [edge.get("sea_level") for edge in edges if edge.get("sea_level") is not None]
+    if levels:
+        border["sea_level"] = float(levels[0])
+    return border
 
 
 def assets_of(world):
@@ -601,6 +636,7 @@ class Studio:
         self.detail_level = "medium"
         self.detail_mode = "noise"
         self.advanced_export = True
+        self.export_dir = None
         self.panel_scroll = 0
         self.panel_max_scroll = 0
         self.option_buttons = {name: Button("", 252) for name in OPTIONS}
@@ -608,6 +644,8 @@ class Studio:
         self.generate_btn = Button("Generate preview", 252)
         self.export_btn = Button("Export maps", 252)
         self.export_btn.enabled = False
+        self.embellish_btn = Button("Embellish maps", 252)
+        self.last_bundle, self.last_hires = read_latest(latest_pointer())
         self.size_rects = []
         self.thumb_rects = []
         self.view = pygame.Rect(300, 16, 1040, 680)
@@ -630,7 +668,9 @@ class Studio:
         self.busy = False
         self.status = ("Generate a preview. M mountain, V valley, I ice, G dunes, "
                        "O coast, C caves. Generate again to build the strokes in.")
-        self.seed_box = pygame.Rect(16, 72, 252, 28)
+        self.seed_box = pygame.Rect(16, 72, 164, 28)
+        self.random_btn = Button("Random", 80)
+        self.random_btn.rect.topleft = (188, 72)
         self.events = queue.Queue()
         self.clock = pygame.time.Clock()
         self.progress = Progress()
@@ -881,14 +921,21 @@ class Studio:
             args=(cfg, edges, settings, cell, sculpt, token, cancel),
             daemon=True).start()
 
+    def _random_seed(self):
+        return int(np.random.default_rng().integers(0, 0x80000000))
+
+    def randomize_seed(self):
+        """Put a new seed in the box. The next preview builds that world."""
+        self.seed = self._random_seed()
+        self.seed_text = str(self.seed)
+        self.preset_dirty = True
+
     def _preset_for(self, tx, ty):
-        """Sliders are the preset. An untouched seed changes per cell so the interior is a new world rather than a copy of the neighbor."""
+        """Sliders are the preset. A tile with no world yet takes a new seed unless one was just chosen."""
         settings = self.settings()
-        if (not self.preset_dirty and (tx, ty) not in self.atlas
+        if ((tx, ty) not in self.atlas and not self.preset_dirty
                 and self._seed_from in self.atlas):
-            px, py = self._seed_from
-            base = int(self.atlas[(px, py)]["settings"]["seed"])
-            settings["seed"] = (base + (tx - px) * 10007 + (ty - py) * 7919) & 0x7FFFFFFF
+            settings["seed"] = self._random_seed()
         self.seed = int(settings["seed"])
         self.seed_text = str(self.seed)
         self.preset_dirty = False
@@ -906,15 +953,16 @@ class Studio:
             if other is None or other["world"].trees is None:
                 continue
             world = other["world"]
-            actual = np.asarray(world.height, np.float32)
+            relief = world.height_pre if world.height_pre is not None else world.height
+            relief = np.asarray(relief, np.float32)
             neighbor = (tx + dx, ty + dy)
-            solve = actual
+            solve = relief
             current = self.strokes.get(neighbor) or []
             if current and not self._strokes_baked(neighbor):
-                base = actual
+                base = relief
                 baked = self.baked_strokes.get(neighbor)
                 if baked:
-                    base = _without_paint(actual, _thaw_strokes(baked), world.cfg, neighbor)
+                    base = _without_paint(relief, _thaw_strokes(baked), world.cfg, neighbor)
                 solve = paint_relief(base, current)
                 solve = solve + sculpt_grain(solve.shape, current, world.cfg, neighbor)
             shade = np.asarray(world.surface, np.float32)
@@ -924,6 +972,7 @@ class Studio:
                 "height": np.array(take(solve), dtype=np.float32, copy=True),
                 "outer": np.array(outside(solve), dtype=np.float32, copy=True),
                 "strip": _edge_strip(solve, side),
+                "sea_level": getattr(world, "sea_level", None),
                 "shade": np.array(outside(shade), dtype=np.float32, copy=True),
                 "biome": np.array(take(world.biome), copy=True),
                 "cover": np.array(take(canopy), dtype=np.float32, copy=True),
@@ -974,8 +1023,7 @@ class Studio:
             if border:
                 height = value[0] if isinstance(value, tuple) else value
                 if isinstance(height, np.ndarray) and height.ndim == 2:
-                    shown = meet_border(height, border)
-                    shown = hires.downsample(shown, hires.PREVIEW_WIDTH)
+                    shown = hires.downsample(height, hires.PREVIEW_WIDTH)
                     self.events.put(("cell_image", cell,
                                      render.relief(shown).astype(np.uint8), token))
                     return
@@ -990,11 +1038,13 @@ class Studio:
                 level = float(np.mean([np.mean(edge["height"]) for edge in edges]))
                 canvas = np.full((cfg.height, cfg.width), level, np.float32)
                 self.events.put(("cell_image", cell,
-                                 render.relief(meet_border(canvas, border)).astype(np.uint8),
+                                 render.relief(apply_border(canvas, border)).astype(np.uint8),
                                  token))
             world = generate(cfg, verbose=False, on_stage=on_stage,
                              on_preview=on_preview, border=border, sculpt=sculpt or None,
                              sculpt_at=cell)
+            rows, cols = world.height.shape
+            world.tile_origin = (cell[1] * max(rows - 1, 1), cell[0] * max(cols - 1, 1))
             if abandon():
                 return
             self.events.put(("stage", "maps", token))
@@ -1089,6 +1139,9 @@ class Studio:
                     self.export_btn.enabled = self.world is not None
                     self.status = event[1]
                     self.thumbs = event[2]
+                    if len(event) > 4:
+                        self.last_bundle = event[3]
+                        self.last_hires = event[4]
                     self._set_image("world", self.thumbs["world"], fit=True)
                 elif kind == "error":
                     if len(event) > 2 and not self._preview_current(event[2]):
@@ -1166,6 +1219,7 @@ class Studio:
         if (self.tx, self.ty) in self.atlas:
             self._show_cell(self.tx, self.ty, fit=True)
             return
+        self.randomize_seed()
         self.fit()
         self.status = (f"Tile {self.tx},{self.ty} is empty. "
                        "Click Generate preview to build it.")
@@ -1193,11 +1247,51 @@ class Studio:
                 self._show_cell(*cell, fit=False)
             return
         if self._touches_atlas(*cell):
+            if cell == (self.tx, self.ty):
+                return
             self._seed_from = (self.tx, self.ty)
             self.tx, self.ty = cell
             self._fit_when_done = False
+            self.randomize_seed()
             self.status = (f"Tile {cell[0]},{cell[1]} is empty. "
                            "Click Generate preview to build it.")
+
+    def open_embellish(self):
+        command = embellish_command(self.last_bundle, self.last_hires)
+        subprocess.Popen(command, cwd=str(Path(command[1]).parent))
+        if len(command) > 2:
+            self.status = f"Embellish editor is opening {Path(command[2]).name}."
+        else:
+            self.status = "Embellish editor is open. Choose an export."
+
+    def _ask_export_folder(self):
+        """Folder the user picked, None to use the studio default, False if they cancelled."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError:
+            self.status = "The folder dialog is unavailable, so maps go to the usual export folder."
+            return None
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        start = self.export_dir or ASSETS
+        if not Path(start).is_dir():
+            start = Path.home()
+        root.update()
+        chosen = filedialog.askdirectory(
+            title="Choose a folder for the exported maps",
+            initialdir=str(start),
+            mustexist=True,
+        )
+        root.destroy()
+        if not chosen:
+            return False
+        self.export_dir = Path(chosen)
+        return self.export_dir
 
     def export(self):
         if self.world is None or self.busy:
@@ -1205,6 +1299,10 @@ class Studio:
         if self._paint_pending():
             self.status = ("Generate preview to build the painted mountains and valleys, "
                            "then export.")
+            return
+        destination = self._ask_export_folder()
+        if destination is False:
+            self.status = "Export cancelled."
             return
         self.busy = True
         self.job = "export"
@@ -1222,9 +1320,12 @@ class Studio:
             steps.append(("tiles", ntiles))
         else:
             steps.append(("writing", 8))
+        where = destination if destination is not None else LIBRARY_TERRAIN
         self.progress.begin(f"Exporting {hires.EXPORT_LABELS[self.res_i]}", steps)
+        self.status = f"Exporting to {where}."
         threading.Thread(
-            target=self._export_worker, args=(width, settings, resim), daemon=True).start()
+            target=self._export_worker,
+            args=(width, settings, resim, destination), daemon=True).start()
 
     def _export_span(self, width):
         """Pixel size of the export. Every generated tile is part of that image."""
@@ -1258,7 +1359,7 @@ class Studio:
                         sculpt=self._sculpt_payload((self.tx, self.ty)) or None,
                         sculpt_at=(self.tx, self.ty))
 
-    def _export_worker(self, width, settings, resim):
+    def _export_worker(self, width, settings, resim, destination=None):
         w, h, span = self._export_span(width)
         try:
             if resim:
@@ -1307,10 +1408,18 @@ class Studio:
             else:
                 stem = (f"{settings.get('preset', 'earthlike')}_seed{seed}_"
                         f"atlas{span[0]}x{span[1]}_{w}x{h}")
-            folder = LIBRARY_TERRAIN / "hires" / stem
+            if destination:
+                hires_parent = Path(destination) / "hires"
+                game_dir = Path(destination)
+                bundle_parent = Path(destination)
+            else:
+                hires_parent = LIBRARY_TERRAIN / "hires"
+                game_dir = LIBRARY_TERRAIN
+                bundle_parent = BUNDLE_PARENT
+            folder = hires_parent / stem
             index = 2
             while folder.exists():
-                folder = LIBRARY_TERRAIN / "hires" / f"{stem}-{index}"
+                folder = hires_parent / f"{stem}-{index}"
                 index += 1
             self.events.put(("status", f"upscaling the generated tiles to {w}×{h}"))
             metadata = {
@@ -1350,14 +1459,19 @@ class Studio:
                     height, mask, flow, w, h, seed, folder,
                     detail_fraction=detail_fraction, generator_info=metadata,
                     **atlas_sampling)
-            game = write_game_copy(game_made, LIBRARY_TERRAIN, world=game_world)
-            bundle = export.bundle(world, parent=BUNDLE_PARENT,
+            game = write_game_copy(game_made, game_dir, world=game_world)
+            bundle = export.bundle(world, parent=bundle_parent,
                                    advanced=settings["advanced_export"])
             Image.fromarray(_rgb(hires.downsample(color, hires.PREVIEW_WIDTH)), "RGB").save(
                 bundle / "main_view.png")
             note = (f"exported {w}×{h} to {folder.as_posix()}. "
                     f"Game copy is in {game.as_posix()}. Bundle is {bundle.as_posix()}")
-            self.events.put(("exported", note, preview_thumbs(made)))
+            latest_pointer().write_text(json.dumps({
+                "bundle": str(bundle),
+                "hires": str(folder),
+                "game": str(game_dir),
+            }, indent=1))
+            self.events.put(("exported", note, preview_thumbs(made), str(bundle), str(folder)))
         except Exception as err:
             self.events.put(("error", f"export failed: {err}"))
 
@@ -1961,11 +2075,14 @@ class Studio:
         self.screen.blit(self.big.render("Terrain assets", True, TEXT), (16, y))
         y += 36
         self.screen.blit(self.small.render("seed", True, MUTED), (16, y))
-        box = pygame.Rect(16, y + 18, 252, 28)
+        box = pygame.Rect(16, y + 18, 164, 28)
         pygame.draw.rect(self.screen, (16, 18, 22), box, border_radius=4)
         pygame.draw.rect(self.screen, LINE, box, 1, border_radius=4)
         self.screen.blit(self.font.render(self.seed_text or " ", True, TEXT), (24, y + 22))
         self.seed_box = box
+        self.random_btn.rect.topleft = (188, y + 18)
+        self.random_btn.enabled = not self.busy
+        self.random_btn.draw(self.screen, self.small)
         y += 62
         self.screen.blit(self.small.render("export resolution", True, MUTED), (16, y))
         y += 18
@@ -2017,7 +2134,11 @@ class Studio:
         self.export_btn.rect.topleft = (16, y)
         self.export_btn.label = "Exporting..." if self.busy and self.job == "export" else "Export maps"
         self.export_btn.draw(self.screen, self.font)
-        y += 46
+        y += 36
+        self.embellish_btn.rect.topleft = (16, y)
+        self.embellish_btn.enabled = not self.busy
+        self.embellish_btn.draw(self.screen, self.font)
+        y += 40
         y = self._wrapped(self.status, 16, y, 252)
         if self.panel_max_scroll > 0:
             y = self._wrapped("Scroll the panel for the rest of the controls.", 16, y, 252)
@@ -2102,6 +2223,11 @@ class Studio:
 
     def on_click(self, pos):
         in_panel = pos[0] < 284 and pos[1] < self.screen.get_height() - BAR_H
+        if in_panel and self.random_btn.rect.collidepoint(pos):
+            if self.random_btn.enabled:
+                self.randomize_seed()
+                self.status = f"Seed {self.seed}."
+            return
         if in_panel and self.seed_box.collidepoint(pos):
             return
         if in_panel and any(slider.rect.inflate(0, 10).collidepoint(pos) for slider in
@@ -2136,6 +2262,9 @@ class Studio:
                 return
             if self.export_btn.rect.collidepoint(pos) and self.export_btn.enabled:
                 self.export()
+                return
+            if self.embellish_btn.enabled and self.embellish_btn.rect.collidepoint(pos):
+                self.open_embellish()
                 return
         for rect, name in self.thumb_rects:
             if rect.collidepoint(pos) and name in self.thumbs:

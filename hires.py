@@ -426,7 +426,7 @@ def _limits(height, detail_fraction=DETAIL_FRACTION, detail_reference_span=None)
 def _manifest(height, full_w, full_h, seed, lo, hi, scale, tiled,
               detail_fraction=DETAIL_FRACTION, generator_info=None,
               wrap_x=True, tile_origin=(0, 0), detail_reference_span=None,
-              detail_mode="noise"):
+              detail_mode="noise", world_width_m=200_000.0):
     meta = {
         "width": int(full_w),
         "height": int(full_h),
@@ -439,6 +439,7 @@ def _manifest(height, full_w, full_h, seed, lo, hi, scale, tiled,
         "hi": hi,
         "units_per_code": scale / 65535.0,
         "metres_per_unit": METRES_PER_UNIT,
+        "world_width_m": float(world_width_m),
         "sea_code": (0.0 - lo) / scale * 65535.0,
         "detail": (f"seeded value noise, +/- {detail_fraction:.1%} of "
                    + ("the simulated height range" if detail_reference_span is None
@@ -541,7 +542,7 @@ def write_direct(height, mask, flow, full_w, full_h, seed, dest,
                   detail_fraction=detail_fraction, generator_info=generator_info,
                   wrap_x=wrap_x, tile_origin=tile_origin,
                   detail_reference_span=detail_reference_span,
-                  detail_mode=detail_mode), indent=1))
+                  detail_mode=detail_mode, world_width_m=world_width_m), indent=1))
     return dest
 
 
@@ -599,5 +600,5 @@ def write_tiles(height, mask, flow, full_w, full_h, seed, dest,
                   detail_fraction=detail_fraction, generator_info=generator_info,
                   wrap_x=wrap_x, tile_origin=tile_origin,
                   detail_reference_span=detail_reference_span,
-                  detail_mode=detail_mode), indent=1))
+                  detail_mode=detail_mode, world_width_m=world_width_m), indent=1))
     return dest

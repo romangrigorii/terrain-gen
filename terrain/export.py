@@ -112,8 +112,21 @@ def _sidecar(path, meta):
     return meta
 
 
+def elevation_bounds(*fields):
+    """One physical range for every tile of a height field."""
+    if not fields:
+        raise ValueError("elevation_bounds needs at least one height field")
+    lo = min(float(np.min(field)) for field in fields)
+    hi = max(float(np.max(field)) for field in fields)
+    return lo, hi
+
+
 def heightmap(h, path, lo=None, hi=None):
-    """Write `h` as a 16-bit PNG, and a JSON sidecar saying what the codes mean."""
+    """Write `h` as a 16-bit PNG, and a JSON sidecar saying what the codes mean.
+
+    Pass `lo` and `hi` from `elevation_bounds` when `h` is one tile of a larger
+    field. Per-tile extrema make the same height encode as a different code.
+    """
     lo = float(np.min(h)) if lo is None else float(lo)
     hi = float(np.max(h)) if hi is None else float(hi)
     span = max(1e-9, hi - lo)

@@ -4,6 +4,10 @@ from dataclasses import dataclass, field, asdict, replace
 
 import numpy as np
 from . import climate, elevation, grid, hydrology, rivers, tectonics, trees, noise
+from .boundary_momentum import (
+    apply_boundary_slope, coast_distance, conform_shore, continue_boundary,
+    continue_shore, momentum, side_weight,
+)
 from .config import Config, _scale_to_size
 
 
@@ -28,6 +32,7 @@ class World:
     placed_ice: np.ndarray = None    # metres of ice stamped by a brush
     placed_sand: np.ndarray = None   # metres of dune sand
     placed_void: np.ndarray = None   # metres of cave void under the roof
+    sea_level: float = None          # subtracted from this tile; shared across a planet
 
     @property
     def land(self):
@@ -78,6 +83,15 @@ class World:
         return generate_tile(self, spec)
 
 
+def _border_sides(border):
+    """Side records only. `sea_level` lives on the same dict and is a number."""
+    if not border:
+        return
+    for side, spec in border.items():
+        if side in ("left", "right", "top", "bottom") and isinstance(spec, dict):
+            yield side, spec
+
+
 def apply_border(h, border, inplace=False):
     """Copy each neighbor's rim onto that side of `h`."""
     if border is None:
@@ -85,7 +99,7 @@ def apply_border(h, border, inplace=False):
     if not inplace:
         h = np.array(h, copy=True)
     rows, cols = h.shape
-    for side, spec in border.items():
+    for side, spec in _border_sides(border):
         edge = np.asarray(spec["edge"], np.float32)
         if side == "left" and edge.shape == (rows,):
             h[:, 0] = edge
@@ -109,6 +123,11 @@ def border_bounds(border, shape):
         if side not in border:
             return None
         spec = border[side]
+        strip = spec.get("strip")
+        if strip is not None:
+            strip = np.asarray(strip, np.float32)
+            if strip.ndim == 2 and strip.shape[0] == n and strip.shape[1] >= 2:
+                return np.asarray(strip[:, -2], np.float32)
         ghost = spec.get("outer", spec.get("edge"))
         ghost = np.asarray(ghost, np.float32)
         if ghost.shape != (n,):
@@ -163,9 +182,7 @@ def _hermite_join(src, border, reach):
         acc[band] += ramp * w
         weight[band] += w
 
-    for side, spec in border.items():
-        if side not in ("left", "right", "top", "bottom"):
-            continue
+    for side, spec in _border_sides(border):
         edge = np.asarray(spec["edge"], np.float64)
         expect = rows if side in ("left", "right") else cols
         if edge.shape != (expect,):
@@ -196,7 +213,7 @@ def meet_border(height, border, reach=None):
         "bottom": (-1, slice(None)),
     }
     owned = {}
-    for side, spec in border.items():
+    for side, spec in _border_sides(border):
         edge = np.asarray(spec["edge"], np.float64)
         slot = sides.get(side)
         if slot is None:
@@ -218,152 +235,165 @@ def meet_border(height, border, reach=None):
     return out.astype(np.float32, copy=False)
 
 
-def _smootherstep(t):
-    """Perlin's quintic. Zero slope at both ends, so a blend does not crease."""
-    t = np.clip(np.asarray(t, np.float64), 0.0, 1.0)
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+def refresh_flow(height, weights, method="iterative"):
+    """Route `height` as it stands. Call this after a border edit, not before it."""
+    filled = hydrology.fill_depressions(np.asarray(height, np.float32), 0.0, method=method)
+    rec, _, _ = hydrology.flow_routing(filled)
+    flow = hydrology.accumulate(filled, rec, weights)
+    return filled, flow, rec
 
 
-def _shift_line(values, dy):
-    base = np.arange(values.shape[0], dtype=np.float64)
-    index = base - np.asarray(dy, np.float64)
-    return np.interp(index, base, np.asarray(values, np.float64))
+def resolve_sea_level(field, land_fraction, border=None):
+    """One sea level for a planet. A bordered tile does not choose another."""
+    if border:
+        shared = border.get("sea_level")
+        if shared is not None:
+            return float(shared)
+        matched = _level_from_edges(field, border)
+        if matched is not None:
+            return matched
+    return float(grid.area_quantile(field, 1.0 - land_fraction))
 
 
-def _box_mean(values, radius):
-    radius = int(max(0, radius))
-    if radius == 0:
-        return np.asarray(values, np.float64)
-    padded = np.pad(np.asarray(values, np.float64), radius, mode="edge")
-    kernel = np.ones(radius * 2 + 1, np.float64) / (radius * 2 + 1)
-    return np.convolve(padded, kernel, mode="valid")
-
-
-def _edge_drift(strip):
-    """How far a feature slides along the edge for each step toward this tile."""
-    span, depth = strip.shape
-    if depth < 4:
-        return np.zeros(span, np.float64)
-    newer = strip[:, -1]
-    older = strip[:, -3]
-    # A flat coast matches every small slide. Start at zero and move only
-    # when another slide is actually closer, so a straight shore stays straight.
-    best = np.zeros(span, np.float64)
-    err = _box_mean((newer - older) ** 2, 4)
-    for dy in range(-6, 7):
-        if dy == 0:
+def _level_from_edges(field, border):
+    """Shift that puts this tile's rim in the neighbor's sea frame."""
+    field = np.asarray(field, np.float64)
+    rows, cols = field.shape
+    deltas = []
+    for side, spec in border.items():
+        if not isinstance(spec, dict) or "edge" not in spec:
             continue
-        mismatch = _box_mean((newer - _shift_line(older, dy)) ** 2, 4)
-        take = mismatch < err
-        best[take] = dy
-        err[take] = mismatch[take]
-    # The pair is two pixels apart, so one step inward is half that slide.
-    return _box_mean(best / 2.0, 5)
-
-
-def _side_line(field, side, distance):
-    if side == "left":
-        return field[:, distance]
-    if side == "right":
-        return field[:, -1 - distance]
-    if side == "top":
-        return field[distance, :]
-    return field[-1 - distance, :]
-
-
-def _land_runs(mask, shortest=4):
-    runs = []
-    start = None
-    for index, on in enumerate(mask):
-        if on and start is None:
-            start = index
-        elif not on and start is not None:
-            if index - start >= shortest:
-                runs.append((start, index))
-            start = None
-    if start is not None and len(mask) - start >= shortest:
-        runs.append((start, len(mask)))
-    return runs
-
-
-def _body_weight(origin, start, stop, feather):
-    outside = np.maximum(start - origin, origin - (stop - 1))
-    outside = np.maximum(outside, 0.0)
-    return 1.0 - _smootherstep(outside / feather)
-
-
-def _carry_run(field, strip, side, start, stop, drift, sea):
-    """Carry one landmass in by its drift, without a shelf along the seam.
-
-    Burt and Adelson blend a coarse shape over a wide zone and fine detail over
-    a short one. The wide zone uses Perlin's quintic, so the slope is flat
-    where the mass meets the rim and where it rejoins this tile.
-    """
-    depth = strip.shape[1]
-    thickness = 0
-    for column in range(depth - 1, -1, -1):
-        if float((strip[start:stop, column] > sea).mean()) < 0.45:
-            break
-        thickness += 1
-    thickness = max(thickness, 3)
-    flow = float(np.clip(np.median(drift[start:stop]), -1.5, 1.5))
-    span = field.shape[0] if side in ("left", "right") else field.shape[1]
-    limit = (field.shape[1] if side in ("left", "right") else field.shape[0]) // 2 - 1
-    reach = int(np.clip(max(thickness * 2, 24), 16, max(16, limit)))
-    detail = max(4, reach // 5)
-    profile = strip[:, -1].astype(np.float64)
-    radius = max(3, (stop - start) // 6)
-    low = _box_mean(profile, radius)
-    high = profile - low
-    positions = np.arange(span, dtype=np.float64)
-    feather = 8.0
-    for distance in range(reach):
-        if distance >= (field.shape[1] if side in ("left", "right") else field.shape[0]):
-            break
-        slide = flow * distance
-        origin = positions - slide
-        mask = _body_weight(origin, start, stop, feather)
-        coarse = (1.0 - _smootherstep(distance / max(reach - 1, 1))) * mask
-        fine = (1.0 - _smootherstep(min(distance / detail, 1.0))) * mask
-        line = _side_line(field, side, distance)
-        low_here = _box_mean(line, radius)
-        high_here = np.asarray(line, np.float64) - low_here
-        blended = (_shift_line(low, slide) * coarse + low_here * (1.0 - coarse)
-                   + _shift_line(high, slide) * fine + high_here * (1.0 - fine))
-        line[:] = blended.astype(np.float32)
+        edge = np.asarray(spec["edge"], np.float64)
+        if side == "left" and edge.shape == (rows,):
+            deltas.append(field[:, 0] - edge)
+        elif side == "right" and edge.shape == (rows,):
+            deltas.append(field[:, -1] - edge)
+        elif side == "top" and edge.shape == (cols,):
+            deltas.append(field[0, :] - edge)
+        elif side == "bottom" and edge.shape == (cols,):
+            deltas.append(field[-1, :] - edge)
+    if not deltas:
+        return None
+    return float(np.median(np.concatenate(deltas)))
 
 
 def carry_mass(height, border, sea=0.0):
-    """Continue a landmass that meets the edge, along the way it was already heading.
+    """Continue every incoming edge by its own sideways motion.
 
-    The shared rim stays the neighbor's edge. The body's broad shape eases into
-    this tile over a wide zone, and its small ridges only near the cut. Open
-    water on the edge is left to the short rim blend.
+    Broad shape and fine ridges both run in from the strip. The shoreline
+    distance runs with them, so a diagonal coast is not only a height match.
     """
     if not border:
         return height
-    field = np.array(height, np.float32, copy=True)
+    source = np.asarray(height, np.float64)
+    rows, cols = source.shape
+    acc = np.zeros_like(source)
+    weight = np.zeros_like(source)
+    shore_acc = np.zeros_like(source)
+    shore_w = np.zeros_like(source)
+    pinned = []
+    source_shore = None
     for side, spec in border.items():
         if side not in ("left", "right", "top", "bottom"):
             continue
         strip = spec.get("strip")
         if strip is None:
             continue
-        strip = np.asarray(strip, np.float32)
-        span = field.shape[0] if side in ("left", "right") else field.shape[1]
-        if strip.ndim != 2 or strip.shape[0] != span or strip.shape[1] < 4:
+        strip = np.asarray(strip, np.float64)
+        span = rows if side in ("left", "right") else cols
+        if strip.ndim != 2 or strip.shape[0] != span or strip.shape[1] < 2:
             continue
-        drift = _edge_drift(strip)
-        for start, stop in _land_runs(strip[:, -1] > sea):
-            _carry_run(field, strip, side, start, stop, drift, sea)
-    return field
+        depth = cols if side in ("left", "right") else rows
+        # A long copy of the edge profile is a wall perpendicular to the seam.
+        # The coast may step sideways a little. The new tile keeps its own grain.
+        reach = float(min(32, max(1, depth - 1)))
+        detail = 0.0
+        sigma = 4.0
+        velocity, residual = momentum(strip, tangent_sigma=sigma)
+        velocity = np.clip(velocity * 0.25, -0.7, 0.7)
+        continued = continue_boundary(
+            source, strip, side, reach=reach, detail_reach=detail,
+            tangent_sigma=sigma, velocity=velocity, residual=residual)
+        w = side_weight(source.shape, side, reach)
+        acc += w * continued
+        weight += w
+        if source_shore is None:
+            source_shore = coast_distance(source, sea)
+        shore = continue_shore(
+            source, strip, side, sea=sea, reach=reach, detail_reach=detail,
+            tangent_sigma=sigma)
+        shore_acc += w * shore
+        shore_w += w
+        pinned.append((side, strip))
+    if not pinned:
+        return np.asarray(height, np.float32)
+    out = source.copy()
+    known = weight > 1e-8
+    out[known] = acc[known] / weight[known]
+    if source_shore is not None:
+        shore = source_shore.copy()
+        known_shore = shore_w > 1e-8
+        shore[known_shore] = shore_acc[known_shore] / shore_w[known_shore]
+        out = conform_shore(out, shore, sea)
+    _pin_edges(out, [(side, strip[:, -1]) for side, strip in pinned])
+    return out.astype(np.float32)
+
+
+def _seed_boundary_slope(height, border):
+    """Give the solver the incoming slope once, before it moves sediment."""
+    if not border:
+        return height
+    rows, cols = height.shape
+    for side, spec in border.items():
+        if side not in ("left", "right", "top", "bottom") or not isinstance(spec, dict):
+            continue
+        strip = spec.get("strip")
+        if strip is None:
+            continue
+        strip = np.asarray(strip, np.float64)
+        span = rows if side in ("left", "right") else cols
+        if strip.ndim != 2 or strip.shape[0] != span or strip.shape[1] < 2:
+            continue
+        if (side in ("left", "right") and cols < 2) or (side in ("top", "bottom") and rows < 2):
+            continue
+        apply_boundary_slope(height, strip, side)
+    return height
+
+
+def check_corner(a, b, tolerance=1e-5):
+    """A shared corner is one value. Two neighbors may not vote a third."""
+    if abs(float(a) - float(b)) > tolerance:
+        raise ValueError("Neighboring tiles disagree at their shared corner")
+    return float(a)
+
+
+def _pin_edges(field, pinned):
+    """The shared pixel is the neighbor's. A corner must already be one value."""
+    slots = {
+        "left": (slice(None), 0),
+        "right": (slice(None), -1),
+        "top": (0, slice(None)),
+        "bottom": (-1, slice(None)),
+    }
+    owned = {}
+    for side, edge in pinned:
+        field[slots[side]] = edge
+        owned[side] = np.asarray(edge, np.float64)
+    for horizontal, vertical, y, x in (
+        ("left", "top", 0, 0),
+        ("right", "top", 0, -1),
+        ("left", "bottom", -1, 0),
+        ("right", "bottom", -1, -1),
+    ):
+        if horizontal in owned and vertical in owned:
+            field[y, x] = check_corner(owned[horizontal][y], owned[vertical][x])
 
 
 def _pin_biome(biome, border):
     if not border:
         return
     rows, cols = biome.shape
-    for side, spec in border.items():
+    for side, spec in _border_sides(border):
         col = spec.get("biome")
         if col is None:
             continue
@@ -454,7 +484,7 @@ def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, border=None
     # Rain is computed next so erosion has a climate, then temperature and
     # biomes are computed again on the eroded surface. Latitude drives that
     # climate. It does not decide where the crust is.
-    level = grid.area_quantile(pre, 1.0 - cfg.land_fraction)
+    level = resolve_sea_level(pre, cfg.land_fraction, border)
     raw -= level
     pre -= level
     def coastline():
@@ -466,9 +496,9 @@ def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, border=None
             h = h + elevation.sculpt_grain(h.shape, sculpt, cfg, sculpt_at)
         if not border:
             return h
-        # The rim blend keeps the seam. A landmass on that edge then keeps
-        # travelling into this tile instead of ending on the cut.
-        return carry_mass(meet_border(h, border), border)
+        # The incoming strip sets the rim and carries its direction inward.
+        # Later stages pin that rim. They do not fade the continuation away.
+        return carry_mass(h, border)
 
     pre = stage("coastline", coastline)
 
@@ -537,13 +567,20 @@ def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, border=None
                 cfg.erosion_n, iters, cfg.talus, weights=wet,
                 depression_method=cfg.depression_method)
             return _settle(carved, filled, flow, rec)
+        def pin(field):
+            apply_border(field, border, inplace=True)
+
+        started = np.array(pre, np.float32, copy=True)
+        _seed_boundary_slope(started, border)
         with grid.use_bounds(border_bounds(border, pre.shape)):
             carved, filled, flow, rec = hydrology.stream_power(
-                pre.copy(), 0.0, passes, k, cfg.erosion_m,
+                started, 0.0, passes, k, cfg.erosion_m,
                 cfg.erosion_n, iters, cfg.talus, weights=wet,
-                depression_method=cfg.depression_method)
+                depression_method=cfg.depression_method, pin=pin)
             carved, filled, flow, rec = _settle(carved, filled, flow, rec)
-        return meet_border(carved, border), filled, flow, rec
+            apply_border(carved, border, inplace=True)
+            filled, flow, rec = refresh_flow(carved, wet, cfg.depression_method)
+        return carved, filled, flow, rec
 
     eroded, er_filled, er_flow, er_rec = stage("erosion", erode)
     sst = stage("temperature", lambda: climate.temperature(
@@ -555,12 +592,13 @@ def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, border=None
             return rivers.build(
                 eroded.copy(), cfg, rng, routed=(er_filled, er_rec, er_flow),
                 runoff=runoff, evap=evap, bed_hardness=strata.get("hardness"))
-        bed = meet_border(eroded, border)
+        bed = apply_border(np.array(eroded, np.float32, copy=True), border, inplace=True)
         with grid.use_bounds(border_bounds(border, bed.shape)):
             height, water = rivers.build(
                 bed, cfg, rng, runoff=runoff, evap=evap,
                 bed_hardness=strata.get("hardness"))
-        return meet_border(height, border), water
+        apply_border(height, border, inplace=True)
+        return height, water
 
     h, water = stage("rivers", run_rivers)
     placed_ice = placed_sand = placed_void = None
@@ -585,7 +623,7 @@ def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, border=None
 
     temp, swing, biome = stage("biomes", biomes)
 
-    world = World(cfg=cfg, tect=tect, height_raw=raw, height_pre=pre,
+    world = World(cfg=cfg, tect=tect, height_raw=raw, height_pre=pre, sea_level=float(level),
                   height_eroded=eroded, height=h, water=water, runoff=runoff,
                   temp=temp, swing=swing, biome=biome, trees=None, timings=timings,
                   bedrock=strata.get("bedrock"), sediment=strata.get("sediment"),

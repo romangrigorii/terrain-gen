@@ -28,38 +28,26 @@ class Tectonics:
     overriding: np.ndarray   # nearest boundary: is this side the overrider?
 
 
-def _unit(vectors):
-    vectors = np.asarray(vectors, np.float64)
-    return vectors / np.maximum(np.linalg.norm(vectors, axis=-1, keepdims=True), 1e-12)
-
-
-def _to_pixels(xyz, h, w):
-    """Map unit vectors to equirectangular (y, x). Row 0 is south."""
-    phi = np.arcsin(np.clip(xyz[..., 2], -1.0, 1.0))
-    lam = np.arctan2(xyz[..., 1], xyz[..., 0])
-    y = (phi + np.pi / 2.0) / np.pi * h - 0.5
-    x = (lam + np.pi) / (2.0 * np.pi) * w - 0.5
-    return np.column_stack([np.clip(y, 0, h - 1), np.mod(x, w)])
-
-
 def _seed_points(n, h, w, rng):
-    """Plate centres spread on the sphere, packed by great-circle distance."""
-    rmin = 0.75 * np.sqrt(4.0 * np.pi / n)
-    chosen = []
-    for _ in range(n * 400):
-        if len(chosen) >= n:
+    """Plate centres packed on the map. Longitude wraps. The cold edge is a row, not a point."""
+    rmin = 0.75 * np.sqrt(h * w / n)
+    pts = []
+    for _ in range(n * 200):
+        if len(pts) >= n:
             break
-        p = _unit(rng.normal(size=3))
-        if chosen:
-            dots = np.clip(np.dot(np.asarray(chosen), p), -1.0, 1.0)
-            if np.arccos(dots).min() < rmin:
+        p = np.array([rng.uniform(0, h), rng.uniform(0, w)])
+        if pts:
+            q = np.array(pts)
+            dy = np.abs(q[:, 0] - p[0])
+            dx = np.abs(q[:, 1] - p[1])
+            dx = np.minimum(dx, w - dx)
+            if np.min(np.hypot(dy, dx)) < rmin:
                 rmin *= 0.998
                 continue
-        chosen.append(p)
-    while len(chosen) < n:
-        chosen.append(_unit(rng.normal(size=3)))
-    xyz = np.asarray(chosen, np.float64)
-    return _to_pixels(xyz, h, w), xyz
+        pts.append(p)
+    while len(pts) < n:
+        pts.append(np.array([rng.uniform(0, h), rng.uniform(0, w)]))
+    return np.asarray(pts, np.float64)
 
 
 def warp_field(h, w, rng, periods, amp, octaves=4):
@@ -68,24 +56,22 @@ def warp_field(h, w, rng, periods, amp, octaves=4):
                      noise.fbm(h, w, rng, periods=periods, octaves=octaves) * amp])
 
 
-def _plate_map(seed_xyz, reach, h, w, rng, cfg):
-    """Spherical Voronoi. Noise warps the sample points on the sphere, not a flat sheet."""
-    wy, wx = (warp_field(h, w, rng, cfg.plate_warp_periods, cfg.plate_warp) +
-              warp_field(h, w, rng, cfg.plate_warp_periods * 4, cfg.plate_warp_fine))
-    x, y, z = grid.sphere_xyz((h, w))
-    phi = np.clip(np.arcsin(np.clip(z, -1.0, 1.0)) + wy * (np.pi / max(h, 1)),
-                  -np.pi / 2.0 + 1e-4, np.pi / 2.0 - 1e-4)
-    lam = np.arctan2(y, x) + wx * (2.0 * np.pi / max(w, 1))
-    cos_phi = np.cos(phi)
-    x = cos_phi * np.cos(lam)
-    y = cos_phi * np.sin(lam)
-    z = np.sin(phi)
+def _plate_map(seeds, reach, h, w, rng, cfg):
+    """Weighted Voronoi on the map. A step east is the same length as a step north."""
+    # The short warp is what ripples the border. Keep it only while the
+    # border still steps forward; the broad bend of the plate is left whole.
+    broad = warp_field(h, w, rng, cfg.plate_warp_periods, cfg.plate_warp)
+    fine = warp_field(h, w, rng, cfg.plate_warp_periods * 4, cfg.plate_warp_fine)
+    wy, wx = noise.stack_displacement((broad, fine))
+    yy, xx = np.mgrid[0:h, 0:w]
+    qy = np.clip(yy + wy, 0, h - 1)
+    qx = (xx + wx) % w
 
     plate = np.zeros((h, w), dtype=int)
     best = np.full((h, w), np.inf)
-    for i, center in enumerate(seed_xyz):
-        dot = np.clip(x * center[0] + y * center[1] + z * center[2], -1.0, 1.0)
-        dist = np.arccos(dot) - reach[i]
+    for i, (sy, sx) in enumerate(seeds):
+        dx = np.abs(qx - sx)
+        dist = np.hypot(qy - sy, np.minimum(dx, w - dx)) - reach[i]
         take = dist < best
         best[take] = dist[take]
         plate[take] = i
@@ -96,32 +82,6 @@ def _gate(x, lo, hi):
     """Suppress weak strain entirely, pass strong strain through unchanged."""
     t = np.clip((x - lo) / max(1e-6, hi - lo), 0, 1)
     return x * t * t * (3 - 2 * t)
-
-
-def _continent_potential(h, w, rng, n_features, bias):
-    """Broad crust potential on the sphere. Poles are ordinary points on it."""
-    x, y, z = grid.sphere_xyz((h, w))
-    score = np.zeros((h, w), np.float64)
-    for _ in range(int(n_features)):
-        center = rng.normal(size=3)
-        if bias == "poles":
-            sign = 1.0 if rng.random() < 0.5 else -1.0
-            z_bias = sign * float(rng.uniform(0.62, 0.98))
-            horiz = float(np.sqrt(max(0.0, 1.0 - z_bias * z_bias)))
-            angle = float(rng.uniform(0.0, 2.0 * np.pi))
-            center = np.array([horiz * np.cos(angle), horiz * np.sin(angle), z_bias])
-        else:
-            center = _unit(center)
-        dot = np.clip(x * center[0] + y * center[1] + z * center[2], -1.0, 1.0)
-        angular = np.arccos(dot)
-        if bias == "dispersed":
-            sigma = float(rng.uniform(0.18, 0.42))
-        elif bias == "poles":
-            sigma = float(rng.uniform(0.45, 1.05))
-        else:
-            sigma = float(rng.uniform(0.30, 0.90))
-        score += float(rng.normal()) * np.exp(-0.5 * (angular / sigma) ** 2)
-    return score
 
 
 def _accrete(raw, continental, div, plate):
@@ -148,18 +108,26 @@ def _accrete(raw, continental, div, plate):
 
 
 def _crust(plate, plate_cont, cfg, rng, div=None, other=None):
-    """Continentality from a spherical potential, then collisions and rifts.
+    """Continentality from fractal noise, then collisions and rifts.
 
     A plate can hold both kinds of crust, and a continent can cross a boundary.
+    Latitude does not lower the crust. A polar world only lifts the cold edge
+    where the noise is already high, so that edge is not one solid bar.
     `other` is accepted so older callers keep working; the neighbour crust is
     read from the cells themselves.
     """
     del other
     h, w = plate.shape
-    potential = _continent_potential(h, w, rng, cfg.crust_features, cfg.geography)
+    broad = noise.fbm(h, w, rng, periods=cfg.crust_periods, octaves=6)
     detail = noise.fbm(h, w, rng, periods=cfg.crust_periods * 3, octaves=4)
     lean = plate_cont[plate].astype(np.float64) - 0.5
-    raw = potential + 0.22 * detail + lean * cfg.crust_plate_weight * 0.45
+    raw = 0.85 * broad + 0.35 * detail + lean * cfg.crust_plate_weight * 0.55
+    if cfg.geography == "poles":
+        lat = np.abs(grid.latitude((h, w)))
+        lobes = noise.fbm(h, w, rng, periods=3, octaves=4)
+        raw = raw + lat * (0.9 + 1.2 * np.clip(lobes, 0.0, None))
+    elif cfg.geography == "dispersed":
+        raw = raw + 0.45 * noise.fbm(h, w, rng, periods=cfg.crust_periods * 2, octaves=4)
     raw = noise.warp(raw, *warp_field(h, w, rng, cfg.crust_warp_periods, cfg.crust_warp))
     raw = grid.blur(raw, cfg.crust_blur)
     if div is not None:
@@ -253,39 +221,27 @@ def _boundary_motion(plate, omega, xyz):
     return opening / weight, shear / weight
 
 
-def _surface_velocity(plate, omega, seed_xyz):
-    """Plate arrows at each centre, scaled like the old cell-sized velocities."""
-    n = omega.shape[0]
-    position = seed_xyz
-    linear = np.cross(omega, position)
-    east = np.stack([-position[:, 1], position[:, 0], np.zeros(n)], axis=1)
-    east = _unit(east)
-    north = np.cross(position, east)
-    vy = np.sum(linear * north, axis=1)
-    vx = np.sum(linear * east, axis=1)
-    speed = np.maximum(np.hypot(vy, vx), 1e-6)
-    vel = np.column_stack([vy, vx]) / speed[:, None] * np.linalg.norm(omega, axis=1)[:, None]
-    return vel[plate, 0], vel[plate, 1], vel
-
-
 def build(cfg, rng):
     h, w = cfg.height, cfg.width
     n = cfg.n_plates
 
-    seeds, seed_xyz = _seed_points(n, h, w, rng)
-    spacing = np.sqrt(4.0 * np.pi / n)
-    reach = rng.uniform(-1.0, 1.0, n) * cfg.plate_size_var * spacing * 0.45
-    plate = _plate_map(seed_xyz, reach, h, w, rng, cfg)
+    seeds = _seed_points(n, h, w, rng)
+    spacing = np.sqrt(h * w / n)
+    reach = rng.uniform(-1.0, 1.0, n) * cfg.plate_size_var * spacing
+    plate = _plate_map(seeds, reach, h, w, rng, cfg)
 
     plate_cont = rng.random(n) < cfg.cont_plate_fraction
     buoyancy = np.where(plate_cont, 1.0, 0.0) + rng.random(n) * 0.3
 
-    omega = _unit(rng.normal(size=(n, 3))) * rng.uniform(0.4, 1.0, (n, 1))
-    opening, shear_raw = _boundary_motion(plate, omega, grid.sphere_xyz((h, w)))
-    div = grid.blur(opening.astype(np.float32), cfg.stress_blur)
-    curl = grid.blur(shear_raw.astype(np.float32), cfg.stress_blur)
+    ang = rng.uniform(0, 2 * np.pi, n)
+    speed = rng.uniform(0.4, 1.0, n)
+    vel = np.column_stack([np.sin(ang), np.cos(ang)]) * speed[:, None]
+    vy, vx = vel[plate, 0], vel[plate, 1]
+    dvy_dy, dvy_dx = grid.gradient(vy)
+    dvx_dy, dvx_dx = grid.gradient(vx)
+    div = grid.blur((dvx_dx + dvy_dy).astype(np.float32), cfg.stress_blur)
+    curl = grid.blur((dvy_dx - dvx_dy).astype(np.float32), cfg.stress_blur)
     other = _neighbour_plate(plate)
-    vy, vx, vel = _surface_velocity(plate, omega, seed_xyz)
 
     crust = _crust(plate, plate_cont, cfg, rng, div=div, other=other)
     is_cont = crust > 0.5
@@ -300,6 +256,9 @@ def build(cfg, rng):
     shear_b = _gate(np.abs(curl) / max(1e-6, float(np.abs(curl).max())), *cfg.shear_gate)
 
     dist, (iy, ix) = grid.edt(~boundary, return_indices=True)
+    # The pixel edge is a staircase. A ridge drawn on that staircase ripples
+    # along the boundary; a short blur takes the stair out and leaves the line.
+    dist = grid.blur(dist.astype(np.float32), 1.25)
 
     def pull(f, spread=True):
         """Carry a boundary value inland, then soften."""

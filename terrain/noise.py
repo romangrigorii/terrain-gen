@@ -60,16 +60,27 @@ def _fade(t):
 
 
 def perlin(h, w, py, px, rng):
-    """Gradient noise, py by px lattice cells, seamless across the x seam."""
-    py, px = max(1, int(py)), max(1, int(px))
-    ang = rng.uniform(0, 2 * np.pi, (py + 1, px + 1))
+    """Gradient noise, seamless across the x seam.
+
+    `px` is a whole number of cells across the width, so the seam meets.
+    `py` may be fractional. A fractional count is what makes one cell the same
+    number of pixels wide as it is tall when the map itself is not square.
+    Y does not wrap, so the last row of gradients is only there to close the
+    bottom cell.
+    """
+    px = max(1, int(round(float(px))))
+    py = float(py)
+    if py < 1e-3:
+        py = 1e-3
+    nrows = int(np.floor(py - 1e-6)) + 2
+    ang = rng.uniform(0, 2 * np.pi, (nrows, px + 1))
     gy, gx = np.sin(ang, dtype=np.float32), np.cos(ang, dtype=np.float32)
     gy[:, -1] = gy[:, 0]  # seam
     gx[:, -1] = gx[:, 0]
     if _BACKEND.get() == "numba":
         return _accelerated_kernel()(h, w, py, px, gy, gx)
-    ys = np.linspace(0, py, h, endpoint=False)
-    xs = np.linspace(0, px, w, endpoint=False)
+    ys = np.linspace(0.0, py, h, endpoint=False)
+    xs = np.linspace(0.0, float(px), w, endpoint=False)
     y0 = np.floor(ys).astype(int)
     x0 = np.floor(xs).astype(int)
     fy = (ys - y0)[:, None]
@@ -98,9 +109,12 @@ def fbm(h, w, rng, periods=4, octaves=6, gain=0.5, ridged=False):
     """Fractal sum of perlin octaves. Ridged variant gives sharp crests."""
     total = np.zeros((h, w), np.float32)
     amp, norm, p = 1.0, 0.0, float(periods)
-    aspect = h / w
     for _ in range(octaves):
-        n = perlin(h, w, round(p * aspect), round(p), rng)
+        # Same pixel size on both axes. Rounding py to an integer stretches
+        # the lowest octave on a map that is wider than it is tall.
+        px = max(1, int(round(p)))
+        py = px * float(h) / float(w)
+        n = perlin(h, w, py, px, rng)
         if ridged:
             n = 1.0 - np.abs(n)
             n = n * n * 2.0 - 1.0
@@ -180,9 +194,88 @@ def fbm_world(y_m, x_m, wavelength, octaves=4, seed=0, gain=0.5, ridged=False,
     return total / np.float32(weight)
 
 
+def _displacement_gradient(field):
+    """Central differences. X wraps, because the map does."""
+    field = np.asarray(field, np.float64)
+    if field.shape[0] < 2 or field.shape[1] < 2:
+        zero = np.zeros_like(field)
+        return zero, zero
+    gy = np.empty_like(field)
+    gx = np.empty_like(field)
+    gy[1:-1] = 0.5 * (field[2:] - field[:-2])
+    gy[0] = field[1] - field[0]
+    gy[-1] = field[-1] - field[-2]
+    gx[:, 1:-1] = 0.5 * (field[:, 2:] - field[:, :-2])
+    gx[:, 0] = 0.5 * (field[:, 1] - field[:, -1])
+    gx[:, -1] = 0.5 * (field[:, 0] - field[:, -2])
+    return gy, gx
+
+
+def _peak_gradient(dy, dx):
+    """Largest Frobenius norm of the displacement Jacobian."""
+    y_y, y_x = _displacement_gradient(dy)
+    x_y, x_x = _displacement_gradient(dx)
+    fro = np.sqrt(y_y * y_y + y_x * y_x + x_y * x_y + x_x * x_x)
+    return float(np.max(fro)) if fro.size else 0.0
+
+
+def limit_displacement(dy, dx, limit=0.85):
+    """Scale a warp so the map y+dy, x+dx cannot fold back on itself.
+
+    Folding is what turns a smooth push into ripples and stretched streaks.
+    The displacement Jacobian has to stay inside the unit disk: if its
+    Frobenius norm exceeds 1, some step on the map reverses.
+    """
+    dy = np.asarray(dy, np.float64)
+    dx = np.asarray(dx, np.float64)
+    peak = _peak_gradient(dy, dx)
+    if peak > float(limit) and peak > 0.0:
+        scale = float(limit) / peak
+        dy = dy * scale
+        dx = dx * scale
+    return dy, dx
+
+
+def stack_displacement(layers, limit=0.85):
+    """Add warps from broadest to finest without letting a later one fold the map.
+
+    The fine layer is the ripple on a boundary. It is scaled down until the
+    coordinate map still steps forward everywhere. A broad layer that was
+    already safe is left as it is.
+    """
+    dy = dx = None
+    limit = float(limit)
+    for layer in layers:
+        ly, lx = layer
+        ly = np.asarray(ly, np.float64)
+        lx = np.asarray(lx, np.float64)
+        if dy is None:
+            dy, dx = limit_displacement(ly, lx, limit)
+            continue
+        if _peak_gradient(dy + ly, dx + lx) <= limit:
+            dy = dy + ly
+            dx = dx + lx
+            continue
+        lo, hi, share = 0.0, 1.0, 0.0
+        for _ in range(12):
+            mid = (lo + hi) * 0.5
+            if _peak_gradient(dy + mid * ly, dx + mid * lx) <= limit:
+                share = mid
+                lo = mid
+            else:
+                hi = mid
+        if share > 0.0:
+            dy = dy + share * ly
+            dx = dx + share * lx
+    if dy is None:
+        raise ValueError("stack_displacement needs at least one layer")
+    return dy, dx
+
+
 def warp(field, dy, dx):
     """Resample `field` at (y+dy, x+dx); x wraps, y clamps."""
+    dy, dx = limit_displacement(dy, dx)
     h, w = field.shape
     yy, xx = np.mgrid[0:h, 0:w]
-    coords = np.stack([np.clip(yy + dy, 0, h - 1), (xx + dx) % w])
+    coords = np.stack([np.clip(yy + dy, 0, h - 1), np.mod(xx + dx, w)])
     return map_coordinates(field, coords, order=1, mode="grid-wrap")

@@ -137,6 +137,105 @@ def test_lake_label_at_periodic_seam():
     assert not labels[0].any()
 
 
+def _half_corr_lag(field, axis, limit):
+    field = np.asarray(field, np.float64)
+    field = field - field.mean()
+    var = float(np.mean(field * field)) + 1e-12
+    for lag in range(1, limit):
+        if axis == 0:
+            corr = float(np.mean(field[:-lag] * field[lag:])) / var
+        else:
+            corr = float(np.mean(field[:, :-lag] * field[:, lag:])) / var
+        if corr < 0.5:
+            return lag
+    return limit
+
+
+def test_noise_cells_are_square_on_a_wide_map():
+    from terrain import noise
+    field = noise.fbm(90, 120, np.random.default_rng(0), periods=2, octaves=1)
+    y_lag = _half_corr_lag(field, 0, 40)
+    x_lag = _half_corr_lag(field, 1, 40)
+    assert abs(y_lag - x_lag) <= max(2, 0.2 * max(y_lag, x_lag))
+
+
+def test_a_strong_warp_does_not_fold():
+    from terrain import noise
+    rng = np.random.default_rng(1)
+    dy = noise.fbm(48, 64, rng, periods=2, octaves=4) * 80
+    dx = noise.fbm(48, 64, rng, periods=2, octaves=4) * 80
+    dy, dx = noise.limit_displacement(dy, dx)
+    assert noise._peak_gradient(dy, dx) <= 0.85 + 1e-6
+
+
+def _boundary_world(kind):
+    """A straight boundary down the columns, so a profile is just the rows."""
+    from terrain.config import Config
+    from terrain.tectonics import Tectonics
+    h, w = 96, 8
+    dist = np.broadcast_to(np.arange(h, dtype=np.float32)[:, None], (h, w)).copy()
+    zeros = np.zeros((h, w), np.float32)
+    ones = np.ones((h, w), np.float32)
+    conv = rift = shear = zeros
+    cont_self = cont_other = overriding = ones
+    crust = ones.copy()
+    boundary = np.zeros((h, w), dtype=bool)
+    boundary[0] = True
+    if kind == "subduction":
+        conv = ones.copy()
+        cont_other = zeros.copy()
+    elif kind == "rift":
+        rift = ones.copy()
+    elif kind == "transform":
+        shear = ones.copy()
+    else:
+        raise ValueError(kind)
+    return Tectonics(
+        plate=np.zeros((h, w), np.int32), seeds=np.zeros((1, 2)),
+        vel=np.zeros((1, 2)), plate_cont=np.zeros(1, dtype=bool),
+        buoyancy=np.zeros(1), crust=crust, is_cont=crust > 0.5,
+        vy=zeros, vx=zeros, div=zeros, curl=zeros, boundary=boundary,
+        dist=dist, conv=conv, rift=rift, shear=shear,
+        cont_self=cont_self, cont_other=cont_other, overriding=overriding,
+    ), Config(width=w, height=h, upland_h=0.0, age_depth=0.0, arc_h=0.0)
+
+
+def _interior_peaks(profile):
+    return np.flatnonzero(
+        (profile[1:-1] > profile[:-2] + 1e-4) & (profile[1:-1] > profile[2:] + 1e-4))
+
+
+def test_a_plate_boundary_is_one_ridge():
+    from terrain.elevation import tectonic_relief
+    tect, cfg = _boundary_world("subduction")
+    relief = tectonic_relief(tect, cfg, np.random.default_rng(0))
+    for column in relief.T:
+        assert len(_interior_peaks(column)) == 1
+    tect, cfg = _boundary_world("rift")
+    relief = tectonic_relief(tect, cfg, np.random.default_rng(0))
+    for column in relief.T:
+        assert len(_interior_peaks(column)) == 0
+        assert np.all(np.diff(column) >= -1e-5)
+    tect, cfg = _boundary_world("transform")
+    relief = tectonic_relief(tect, cfg, np.random.default_rng(0))
+    for column in relief.T:
+        assert len(_interior_peaks(column)) == 0
+
+
+def test_a_fine_warp_does_not_ripple_the_broad_one():
+    from terrain import noise
+    rng = np.random.default_rng(2)
+    coarse = noise.fbm(48, 64, rng, periods=2, octaves=2) * 6
+    coarse_x = noise.fbm(48, 64, rng, periods=2, octaves=2) * 6
+    fine = noise.fbm(48, 64, rng, periods=10, octaves=4) * 40
+    fine_x = noise.fbm(48, 64, rng, periods=10, octaves=4) * 40
+    dy, dx = noise.stack_displacement(((coarse, coarse_x), (fine, fine_x)))
+    assert noise._peak_gradient(dy, dx) <= 0.85 + 1e-6
+    # The broad bend is the plate. The fine layer must not replace it.
+    keep = float(np.corrcoef(dy.ravel(), np.asarray(coarse, np.float64).ravel())[0, 1])
+    assert keep > 0.9
+
+
 def test_numba_noise_matches_numpy():
     pytest.importorskip('numba')
     from terrain import noise
@@ -705,11 +804,12 @@ def test_landmass_keeps_sliding_along_the_edge():
         "outer": strip[:, -2].copy(),
         "strip": strip,
     }})
-    # At the rim the land starts on row 19. One pixel of drift per step puts
-    # that edge near row 25 six pixels in, and leaves row 20 behind as sea.
+    # The rim land starts on row 19 and was drifting one pixel per step.
+    # The new tile keeps a fraction of that drift, then returns to itself.
     assert solved[19, 0] > 0.3
-    assert solved[28, 6] > 0.25
-    assert solved[20, 6] < 0.0
+    assert solved[28, 8] > 0.2
+    assert solved[10, 8] < 0.0
+    assert solved[22, -1] == pytest.approx(-0.3, abs=1e-4)
 
 
 def test_continued_land_eases_in_without_a_shelf():
@@ -727,21 +827,45 @@ def test_continued_land_eases_in_without_a_shelf():
         "strip": strip,
     }})
     profile = solved[24].astype(np.float64)
+    # The window is long and quintic: no step at the rim, no crease, and the
+    # far side of the tile is still the candidate.
     assert profile.max() <= profile[0] + 0.02
     assert profile[2] > profile[0] - 0.03
-    assert profile[16] < profile[0] - 0.15
-    assert abs(profile[30] - (-0.2)) < 0.04
-    assert abs(float(profile[30] - profile[31])) < 0.04
-    assert float(np.max(np.abs(np.diff(profile[:31], n=2)))) < 0.02
+    assert profile[31] < profile[0] - 0.1
+    assert profile[31] > -0.2
+    assert abs(profile[-1] - (-0.2)) < 1e-4
+    assert abs(float(profile[-1] - profile[-2])) < 0.04
+    assert float(np.max(np.abs(np.diff(profile, n=2)))) < 0.04
+
+
+def test_a_small_edge_slope_does_not_build_a_wall():
+    """A one-cell slope on the seam must not be integrated into a ridge."""
+    from terrain.world import carry_mass
+
+    rows, cols, depth = 80, 96, 16
+    strip = np.zeros((rows, depth), np.float32)
+    for column in range(depth):
+        strip[:, column] = -0.2 + 0.01 * column
+    strip[30:50, :] += 0.35
+    tile = np.full((rows, cols), -0.2, np.float32)
+    solved = carry_mass(tile, {"left": {
+        "edge": strip[:, -1].copy(),
+        "outer": strip[:, -2].copy(),
+        "strip": strip,
+    }})
+    assert solved[:, 0] == pytest.approx(strip[:, -1], abs=1e-4)
+    assert float(np.max(solved)) < float(np.max(strip[:, -1])) + 0.02
+    assert abs(float(solved[40, -1]) - (-0.2)) < 1e-4
 
 
 def test_continued_land_keeps_the_tile_texture():
-    """Fine relief already on the tile stays; only the broad shape is blended."""
+    """The new tile keeps its own grain. Only the shared edge is replaced."""
     from terrain.world import carry_mass
 
-    rows, cols = 48, 64
+    rows, cols = 48, 160
     tile = np.full((rows, cols), -0.2, np.float32)
-    tile[24, 8] += 0.18
+    tile[24, 4] += 0.18
+    tile[24, -1] += 0.18
     depth = 16
     strip = np.full((rows, depth), -0.2, np.float32)
     strip[16:32, :] = 0.35
@@ -750,5 +874,7 @@ def test_continued_land_keeps_the_tile_texture():
         "outer": strip[:, -2].copy(),
         "strip": strip,
     }})
-    shoulder = 0.5 * (float(solved[24, 7]) + float(solved[24, 9]))
-    assert float(solved[24, 8]) > shoulder + 0.08
+    near = 0.5 * (float(solved[24, 3]) + float(solved[24, 5]))
+    assert float(solved[24, 4]) > near + 0.1
+    assert float(solved[24, -1]) > float(solved[24, -2]) + 0.1
+    assert solved[:, 0] == pytest.approx(strip[:, -1], abs=1e-4)

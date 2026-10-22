@@ -11,31 +11,30 @@ def _band_land(land, rows):
     return float((weights[rows] * land[rows]).sum() / weights[rows].sum())
 
 
-def test_an_east_step_is_shorter_at_the_pole():
+def test_an_east_step_matches_a_north_step():
     lengths = grid.step_lengths((21, 12))
     east = lengths[grid.NEIGH8.index((0, 1))]
-    assert float(east[0, 0]) < float(east[10, 0]) * 0.5
+    north = lengths[grid.NEIGH8.index((1, 0))]
+    assert abs(float(east[0, 0]) - 1.0) < 1e-6
     assert abs(float(east[10, 0]) - 1.0) < 1e-6
-    assert abs(float(east[0, 0]) - grid.METRIC_COS_FLOOR) < 1e-6
+    assert abs(float(north[5, 0]) - 1.0) < 1e-6
 
 
-def test_distance_across_the_seam_uses_that_parallel():
+def test_distance_across_the_seam_is_one_cell():
     mask = np.ones((21, 16), dtype=bool)
     mask[0, 0] = False
     dist = grid.edt(mask)
-    expect = float(grid.metric_cos(mask.shape)[0, 0])
-    assert abs(float(dist[0, 1]) - expect) < 1e-5
-    assert float(dist[0, 1]) < 0.5
+    assert abs(float(dist[0, 1]) - 1.0) < 1e-5
+    assert abs(float(dist[0, -1]) - 1.0) < 1e-5
 
 
-def test_sea_level_counts_equatorial_area_more_heavily():
+def test_sea_level_counts_every_pixel_the_same():
     equator = np.zeros((40, 10))
     equator[18:23] = 1.0
     pole = np.zeros((40, 10))
     pole[:5] = 1.0
-    assert grid.area_quantile(equator, 0.9) == 1.0
-    assert grid.area_quantile(pole, 0.9) == 0.0
-    assert np.quantile(equator, 0.9) == np.quantile(pole, 0.9)
+    assert grid.area_quantile(equator, 0.9) == np.quantile(equator, 0.9)
+    assert grid.area_quantile(pole, 0.9) == np.quantile(pole, 0.9)
 
 
 def test_crust_is_not_stripped_at_the_poles():
@@ -111,6 +110,16 @@ def test_polar_placement_is_a_choice_not_a_penalty():
     tect = tectonics.build(cfg, np.random.default_rng(3))
     lat = np.abs(grid.latitude(tect.crust.shape))[:, 0]
     assert float(tect.crust[lat > 0.65].mean()) > float(tect.crust[lat < 0.25].mean())
+
+
+def test_land_is_not_smeared_into_a_bar():
+    """A cold-edge continent is a blob. It is not one pole copied across the map."""
+    for seed in (1, 3, 7, 11, 21):
+        world = generate(Config(
+            width=96, height=72, seed=seed, erosion_model="none",
+            thermal_iters=0, n_hotspots=0, n_plates=8), verbose=False)
+        row = world.land.mean(axis=1)
+        assert float(row.max()) < 0.98, (seed, float(row.max()))
 
 
 def test_seeds_do_not_share_an_equatorial_belt():

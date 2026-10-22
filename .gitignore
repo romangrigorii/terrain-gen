@@ -26,10 +26,20 @@ test_output/
 test-output/
 tmp/
 *.log
+latest.json
+
+# Intermediate map renders: height tiles, masks, previews, and debug images
+*.png
+zemia_height.png
+zemia_height16.png
+zemia_height16.json
+material_mask.png
+flow_mask.png
+preview.png
+main_view.png
 
 # Documents and pictures
 *.pdf
-*.png
 *.jpg
 *.jpeg
 *.gif

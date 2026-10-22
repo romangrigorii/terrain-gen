@@ -36,20 +36,19 @@ def tectonic_relief(t, cfg, rng):
 
     down = (1.0 - over) * subduction * conv
     up = over * subduction * conv
+    # One shape on each side of the boundary. A second band beside the first
+    # is a ripple running along the plate edge.
     h -= cfg.trench_h * down * _ramp(d, cfg.trench_w)
     segs = np.clip(noise.fbm(hh, w, rng, periods=cfg.arc_break_periods, octaves=4)
                    * 2.4 + cfg.arc_break_bias, 0, 1)
-    h += cfg.arc_h * up * segs * _band(d, cfg.arc_offset, cfg.arc_w)
-    h += cfg.cordillera_h * up * crust * _ramp(d, cfg.cordillera_w)
-    h += 0.15 * cfg.arc_h * up * crust * _band(d, cfg.arc_offset * 2.2, cfg.arc_w * 2)
+    crest = _band(d, cfg.arc_offset, cfg.cordillera_w)
+    h += up * crest * (cfg.cordillera_h * crust + cfg.arc_h * segs)
 
     cont_rift = rift * crust
     h -= cfg.rift_depth * cont_rift * _ramp(d, cfg.rift_w)
-    h += cfg.rift_shoulder * cont_rift * _band(d, cfg.rift_w * 1.6, cfg.rift_w)
     h += cfg.ridge_h * rift * ocean * _ramp(d, cfg.ridge_w)
 
     h -= cfg.transform_h * shear * _ramp(d, cfg.transform_w)
-    h += 0.4 * cfg.transform_h * shear * _band(d, cfg.transform_w * 3, cfg.transform_w * 2)
 
     ridge_src = (t.rift > cfg.ridge_age_thresh) & t.boundary & ~t.is_cont
     if ridge_src.any():

@@ -13,6 +13,7 @@ pip install -r requirements.txt
 ```bash
 python main.py
 python gui.py
+python edit_gui.py
 python preview.py 7
 python -m terrain --preset alpine
 python test_terrain.py
@@ -26,6 +27,8 @@ Drag, WASD, or the arrows pan. The wheel zooms. `Z` fits the map. `1`-`0` and `-
 Sliders in the Edit menu rebuild when you release them: plates, map size, land/sea, shelf roughness, rivers, lakes, and temperature.
 
 `gui.py` is the asset studio. It keeps every generated tile in one atlas, paints mountains and valleys across tile edges, and loads that surface in 3D (`D`: left-drag pans, right-drag orbits, wheel zooms). Presets are `earthlike`, `archipelago`, `supercontinent`, `alpine`, `arid`, and `volcanic`. Export writes the atlas, with optional hierarchical detail, under `out/`.
+
+`edit_gui.py` opens one of those exports and embellishes it: sculpt the height, blend a palette of grounds (soil, sand, rock, snow, ice, mud, water, and volcanic), cut paths and ponds, and place trees, rocks, and buildings. Paint weights sum to one, so strokes mix instead of replacing the whole cell. It writes back into that folder. The first save keeps the untouched rasters in `authored/original`. From the studio, Embellish maps opens the newest export. A tiled export is edited one tile at a time.
 
 ## Layout
 

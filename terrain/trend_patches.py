@@ -14,6 +14,7 @@ field first; the patches only refine it.
 from pathlib import Path
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 
 def smootherstep(t):
@@ -109,6 +110,52 @@ def _sample_grid(field, y, x):
     v01 = field[y1, x0]
     v11 = field[y1, x1]
     return v00 + (v10 - v00) * tx + (v01 - v00) * ty + (v00 - v10 - v01 + v11) * tx * ty
+
+
+def blend_frequency_bands(fields, weights, levels=3):
+    """Blend coarse bands across a wide window and fine bands across a narrow one.
+
+    `fields` and `weights` share one global frame. A coarse ridge therefore
+    crosses a seam farther than a gully does. This refines a residual. It does
+    not reconcile two independently generated continents.
+    """
+    if len(fields) != len(weights) or not fields:
+        raise ValueError("each correction needs a weight")
+    levels = int(levels)
+    if levels < 1:
+        raise ValueError("levels must be at least 1")
+    residual = [np.asarray(field, np.float64) for field in fields]
+    weights = [np.asarray(weight, np.float64) for weight in weights]
+    shape = residual[0].shape
+    acc = np.zeros(shape, np.float64)
+    for level in range(levels):
+        sigma = float(2 ** level)
+        bands = []
+        nxt = []
+        band_w = []
+        for field, weight in zip(residual, weights):
+            smooth = gaussian_filter(field, sigma, mode="nearest")
+            bands.append(field - smooth)
+            nxt.append(smooth)
+            band_w.append(np.clip(gaussian_filter(weight, sigma, mode="nearest"), 0.0, None))
+        acc += _weighted(bands, band_w)
+        residual = nxt
+    broad = [np.clip(gaussian_filter(weight, float(2 ** levels), mode="nearest"), 0.0, None)
+             for weight in weights]
+    acc += _weighted(residual, broad)
+    return acc.astype(np.float32)
+
+
+def _weighted(fields, weights):
+    num = np.zeros_like(fields[0], dtype=np.float64)
+    den = np.zeros_like(fields[0], dtype=np.float64)
+    for field, weight in zip(fields, weights):
+        num += weight * field
+        den += weight
+    out = np.zeros_like(num)
+    known = den > 1e-8
+    out[known] = num[known] / den[known]
+    return out
 
 
 class PatchBlender:

@@ -19,8 +19,7 @@ def test_grid_wraps():
     m = np.ones((8, 8), bool)
     m[4, 0] = False
     d = grid.edt(m)
-    expected = float(grid.cos_latitude(m.shape)[4, 0])
-    assert abs(float(d[4, 7]) - expected) < 1e-5, "distance must cross the seam"
+    assert abs(float(d[4, 7]) - 1.0) < 1e-5, "distance must cross the seam"
 
 
 def test_noise_seamless():

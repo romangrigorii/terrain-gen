@@ -13,13 +13,30 @@ def _belts(shape, cfg, rng):
     return 1.0 - cfg.rain_belts * (1.0 - band) * 0.5
 
 
-def _march(h, land, belts, cap, cfg):
-    """Blow moisture from x=0 to x=w, raining as it goes. One row per latitude."""
+def _march(h, land, belts, cap, cfg, inbound=None, upwind=None, trace=False):
+    """Blow moisture across longitude. `inbound` is the moisture arriving from upwind.
+
+    A full cylinder omits `inbound` and wraps from its own last column. A tile of
+    a larger field passes the moisture and the height the global march already
+    carried to this tile's upwind edge.
+    """
     hh, w = h.shape
-    m = cap[:, -1].copy()
+    if inbound is None:
+        m = cap[:, -1].copy()
+    else:
+        m = np.asarray(inbound, np.float64).copy()
+        if m.shape != (hh,):
+            raise ValueError("inbound moisture must be one value per row")
     rain = np.zeros((hh, w))
-    for lap in range(2):
-        prev = h[:, -1]
+    entering = np.zeros((hh, w)) if trace else None
+    if upwind is not None:
+        upwind = np.asarray(upwind, np.float64)
+        if upwind.shape != (hh,):
+            raise ValueError("upwind height must be one value per row")
+    passes = 1 if inbound is not None else 2
+    for lap in range(passes):
+        prev = h[:, -1] if upwind is None else upwind.copy()
+        writing = lap == passes - 1
         for x in range(w):
             hx = h[:, x]
             climb = np.maximum(hx - prev, 0.0)   # upwind gradient, this cell
@@ -28,10 +45,14 @@ def _march(h, land, belts, cap, cfg):
             r = np.minimum(m * belts[:, x] * (cfg.rain_base +
                                               cfg.rain_orog * climb), m)
             r = np.where(wet, r, 0.0)
+            if writing and entering is not None:
+                entering[:, x] = m
             m = m - r + np.where(wet, r * cfg.rain_recycle,
                                  (cap[:, x] - m) * cfg.rain_ocean_gain)
-            if lap:
+            if writing:
                 rain[:, x] = r
+    if trace:
+        return rain, entering
     return rain
 
 

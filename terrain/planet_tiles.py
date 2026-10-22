@@ -90,6 +90,7 @@ class PlanetState:
     sigma: np.ndarray
     coarse: np.ndarray = None
     patches: object = None
+    features: object = None
     polar_transition: int = 0
 
 
@@ -198,6 +199,9 @@ def sample_global_height(gy, gx, state):
         height += float(weight) * np.exp(-0.5 * (angular / float(sigma)) ** 2)
     if state.coarse is not None:
         height += sample_coarse_height(gy, gx, state)
+    features = getattr(state, "features", None)
+    if features is not None:
+        height += features.evaluate(gy, gx)
     height += _hash_detail(gy, gx, state.seed) * 0.08
     return height.astype(np.float32)
 
@@ -368,6 +372,14 @@ class TiledPlanet:
             int(cfg.seed), int(cfg.world_width), int(cfg.world_height),
             int(cfg.tile_cells), halo=int(cfg.halo), coarse=coarse,
             polar_transition=0)
+        from .features import build_features
+        grid = self.state.grid
+        self.state.features = build_features(
+            int(cfg.seed), grid.cells_y, grid.cells_x,
+            world_width_m=float(grid.cells_x) * 1000.0)
+
+    def set_features(self, features):
+        self.state.features = features
 
     def set_patch_blender(self, blender):
         grid = self.state.grid

@@ -1,4 +1,4 @@
-"""Grid helpers. Longitude wraps. Parallels shorten toward the poles."""
+"""Grid helpers. Longitude wraps. A pixel is the same ground distance in every row."""
 import threading
 from contextlib import contextmanager
 
@@ -167,14 +167,13 @@ def cos_latitude(shape):
     return np.cos(latitude_rad(shape))
 
 
-# Raster steps use this floor so a pole row is not a few metres wide.
-# Sea level uses the true area below, with no floor.
-METRIC_COS_FLOOR = 0.2
-
-
 def metric_cos(shape):
-    """Parallel scale for slopes and neighbour steps."""
-    return np.maximum(cos_latitude(shape), METRIC_COS_FLOOR)
+    """Ground distance of one pixel. The same in every row.
+
+    Latitude still drives climate. It does not shrink an east step, or a
+    continent at the cold edge is painted as a bar.
+    """
+    return np.ones((shape[0], 1), np.float64)
 
 
 def sphere_xyz(shape):
@@ -190,15 +189,12 @@ def sphere_xyz(shape):
 
 
 def cell_area(shape):
-    """Spherical area of each cell. Every cell in a row shares that parallel's zone."""
-    h = shape[0]
-    edges = np.linspace(-np.pi / 2.0, np.pi / 2.0, h + 1)
-    row = np.sin(edges[1:]) - np.sin(edges[:-1])
-    return row[:, None].astype(np.float64)
+    """Ground area of each pixel. Every pixel counts the same."""
+    return np.ones((shape[0], 1), np.float64)
 
 
 def area_quantile(values, fraction):
-    """Value at which `fraction` of the spherical area lies at or below it."""
+    """Value at which `fraction` of the pixels lie at or below it."""
     field = np.asarray(values, np.float64)
     weights = np.broadcast_to(cell_area(field.shape), field.shape).ravel()
     flat = field.ravel()
@@ -210,9 +206,9 @@ def area_quantile(values, fraction):
 
 
 def step_lengths(shape):
-    """Physical length of each 8-neighbour step, in equatorial-cell units.
+    """Length of each 8-neighbour step, in pixels.
 
-    A north-south step stays one cell. An east-west step shrinks with cos(latitude).
+    An east step and a north step are both one pixel.
     """
     cos = metric_cos(shape)
     lengths = []
@@ -325,9 +321,8 @@ def _sweep_row(row, step, sy, sx, wrap):
 def edt(mask, return_indices=False):
     """Distance to the nearest False cell, wrapping in x.
 
-    East-west steps use the parallel's length, so the same pixel gap is shorter
-    near the poles. One downward pass and one upward pass cover the map; the
-    distance is not walked a cell at a time.
+    One downward pass and one upward pass cover the map; the distance is not
+    walked a cell at a time.
     """
     mask = np.asarray(mask, dtype=bool)
     h, w = mask.shape

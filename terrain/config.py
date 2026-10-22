@@ -51,7 +51,7 @@ class Config:
     collision_h: float = 1.30
     collision_w: float = 26.0
     trench_h: float = 0.70
-    trench_w: float = 5.0
+    trench_w: float = 20.0
     arc_h: float = 0.85
     arc_offset: float = 16.0
     arc_w: float = 7.0
@@ -65,7 +65,7 @@ class Config:
     ridge_h: float = 0.28
     ridge_w: float = 18.0
     transform_h: float = 0.13
-    transform_w: float = 4.0
+    transform_w: float = 16.0
     ridge_age_thresh: float = 0.15
     age_depth: float = 0.35
     age_scale: float = 90.0
