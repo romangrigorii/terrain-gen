@@ -451,7 +451,36 @@ def normalize(a, lo=0.0, hi=1.0):
 
 
 def sample_raster(field, y, x, extent_y, extent_x, wrap_x=True):
-    """Bilinear sample of a macro raster covering `[0, extent)` metres."""
+    """Bilinear sample of a macro raster covering `[0, extent)` metres.
+
+    Large windows are sampled in strips. Broadcasting a 4K tile's coordinates
+    into one array is what ran the studio out of memory during a 64K export.
+    """
+    y = np.asarray(y)
+    x = np.asarray(x)
+    shape = np.broadcast_shapes(y.shape, x.shape)
+    if len(shape) == 2 and int(shape[0]) * int(shape[1]) > 256 * 256 and shape[0] > 64:
+        out = np.empty(shape, np.float32)
+        step = 64
+        for y0 in range(0, shape[0], step):
+            y1 = min(shape[0], y0 + step)
+            out[y0:y1] = _sample_raster_full(
+                field, _rows(y, y0, y1, shape[0]), _rows(x, y0, y1, shape[0]),
+                extent_y, extent_x, wrap_x)
+        return out
+    return _sample_raster_full(field, y, x, extent_y, extent_x, wrap_x)
+
+
+def _rows(arr, y0, y1, rows):
+    arr = np.asarray(arr)
+    if arr.ndim == 0 or arr.shape[0] == 1:
+        return arr
+    if arr.shape[0] == rows:
+        return arr[y0:y1]
+    return arr
+
+
+def _sample_raster_full(field, y, x, extent_y, extent_x, wrap_x=True):
     field = np.asarray(field)
     if field.ndim != 2:
         raise ValueError("sample_raster expects a 2D field")

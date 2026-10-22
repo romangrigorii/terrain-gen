@@ -151,8 +151,39 @@ def _hash2(iy, ix, seed):
     return (mixed & np.int64(0xFFFFFF)).astype(np.float32) * np.float32(1.0 / 0xFFFFFF)
 
 
+def _rows(arr, y0, y1, rows):
+    """One strip of a broadcastable row axis. A length-1 axis is left intact."""
+    arr = np.asarray(arr)
+    if arr.ndim == 0 or arr.shape[0] == 1:
+        return arr
+    if arr.shape[0] == rows:
+        return arr[y0:y1]
+    return arr
+
+
 def value_noise_world(y_m, x_m, wavelength, seed, world_width_m=None):
-    """Smooth value noise at absolute metres. Adjacent tiles evaluate the same field."""
+    """Smooth value noise at absolute metres. Adjacent tiles evaluate the same field.
+
+    A 4K export tile used to broadcast its coordinates into multi-gigabyte
+    temporaries. Strips keep the same values and stay small enough to export
+    a 64K map without killing the window.
+    """
+    y_m = np.asarray(y_m)
+    x_m = np.asarray(x_m)
+    shape = np.broadcast_shapes(y_m.shape, x_m.shape)
+    if len(shape) == 2 and int(shape[0]) * int(shape[1]) > 256 * 256 and shape[0] > 64:
+        out = np.empty(shape, np.float32)
+        step = 64
+        for y0 in range(0, shape[0], step):
+            y1 = min(shape[0], y0 + step)
+            out[y0:y1] = _value_noise_world_full(
+                _rows(y_m, y0, y1, shape[0]), _rows(x_m, y0, y1, shape[0]),
+                wavelength, seed, world_width_m)
+        return out
+    return _value_noise_world_full(y_m, x_m, wavelength, seed, world_width_m)
+
+
+def _value_noise_world_full(y_m, x_m, wavelength, seed, world_width_m=None):
     yy, xx = np.broadcast_arrays(np.asarray(y_m, np.float64), np.asarray(x_m, np.float64))
     period = float(max(wavelength, 1e-6))
     y = yy / period

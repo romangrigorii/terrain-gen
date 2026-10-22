@@ -1,4 +1,5 @@
 """High-resolution terrain export."""
+import gc
 import json
 import math
 import os
@@ -7,10 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 from scipy.ndimage import gaussian_filter
 
-from terrain.export import METRES_PER_UNIT, _write_png
+from terrain.export import (
+    FLOW_FEATHER, MASK_FEATHER, METRES_PER_UNIT, _write_png, _write_rgb_png,
+    feather_color,
+)
 from terrain.tiles import RELIEF_UNITS, hierarchical_window
 
 PREVIEW_WIDTH = 640
@@ -476,8 +479,25 @@ def _as_float(image):
 
 
 def _write_color(image, path, mode):
-    Image.fromarray(np.clip(np.rint(image), 0, 255).astype(np.uint8), mode).save(
-        path, compress_level=1)
+    coded = np.clip(np.rint(image), 0, 255).astype(np.uint8)
+    if coded.ndim == 2:
+        coded = coded[..., None]
+    if mode == "RGB" and coded.shape[-1] == 4:
+        coded = coded[..., :3]
+    _write_rgb_png(path, np.ascontiguousarray(coded), level=1)
+
+
+def _write_sampled_color(field, y0, x0, tile_h, tile_w, full_h, full_w, path,
+                         wrap_x=True):
+    """Sample one channel at a time so a 4K tile never holds four float copies."""
+    channels = 1 if field.ndim == 2 else int(field.shape[-1])
+    out = np.empty((tile_h, tile_w, channels), np.uint8)
+    for c in range(channels):
+        plane = field if field.ndim == 2 else field[..., c]
+        sampled = _sample_plane(plane, y0, x0, tile_h, tile_w, full_h, full_w,
+                                wrap_x=wrap_x)
+        out[..., c] = np.clip(np.rint(sampled), 0, 255).astype(np.uint8)
+    _write_rgb_png(path, out, level=1)
 
 
 def _apply_detail(sampled, y0, x0, full_w, seed, detail_amp,
@@ -524,7 +544,9 @@ def write_direct(height, mask, flow, full_w, full_h, seed, dest,
     """One image per map. Used up to 8K, where the upscale still fits in memory."""
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    height_f, mask_f, flow_f = _as_float(height), _as_float(mask), _as_float(flow)
+    height_f = _as_float(height)
+    mask_f = feather_color(_as_float(mask), wrap_x=wrap_x, sigma=MASK_FEATHER)
+    flow_f = feather_color(_as_float(flow), wrap_x=wrap_x, sigma=FLOW_FEATHER)
     lo, hi, detail_amp, scale = _export_limits(
         height_f, detail_mode, detail_fraction, detail_reference_span)
     sampled = _refine(
@@ -533,10 +555,11 @@ def write_direct(height, mask, flow, full_w, full_h, seed, dest,
         wrap_x, tile_origin, world_width_m)
     coded = np.rint(np.clip((sampled - lo) / scale, 0, 1) * 65535).astype(np.uint16)
     _write_png(dest / "height16.png", coded, 16, level=1)
-    _write_color(_sample_tile(mask_f, 0, 0, full_h, full_w, full_h, full_w,
-                              wrap_x=wrap_x), dest / "material_mask.png", "RGBA")
-    _write_color(_sample_tile(flow_f, 0, 0, full_h, full_w, full_h, full_w,
-                              wrap_x=wrap_x), dest / "flow_mask.png", "RGB")
+    del sampled, coded
+    _write_sampled_color(mask_f, 0, 0, full_h, full_w, full_h, full_w,
+                         dest / "material_mask.png", wrap_x=wrap_x)
+    _write_sampled_color(flow_f, 0, 0, full_h, full_w, full_h, full_w,
+                         dest / "flow_mask.png", wrap_x=wrap_x)
     (dest / "manifest.json").write_text(json.dumps(
         _manifest(height, full_w, full_h, seed, lo, hi, scale, tiled=False,
                   detail_fraction=detail_fraction, generator_info=generator_info,
@@ -557,7 +580,9 @@ def write_tiles(height, mask, flow, full_w, full_h, seed, dest,
     for folder in (height_dir, mask_dir, flow_dir):
         folder.mkdir(parents=True, exist_ok=True)
 
-    height_f, mask_f, flow_f = _as_float(height), _as_float(mask), _as_float(flow)
+    height_f = _as_float(height)
+    mask_f = feather_color(_as_float(mask), wrap_x=wrap_x, sigma=MASK_FEATHER)
+    flow_f = feather_color(_as_float(flow), wrap_x=wrap_x, sigma=FLOW_FEATHER)
     lo, hi, detail_amp, scale = _export_limits(
         height_f, detail_mode, detail_fraction, detail_reference_span)
     tiles_y = math.ceil(full_h / TILE)
@@ -576,10 +601,13 @@ def write_tiles(height, mask, flow, full_w, full_h, seed, dest,
             detail_mode, wrap_x, tile_origin, world_width_m)
         coded = np.rint(np.clip((sampled - lo) / scale, 0, 1) * 65535).astype(np.uint16)
         _write_png(height_dir / name, coded, 16, level=1)
-        _write_color(_sample_tile(mask_f, y0, x0, th, tw, full_h, full_w,
-                                  wrap_x=wrap_x), mask_dir / name, "RGBA")
-        _write_color(_sample_tile(flow_f, y0, x0, th, tw, full_h, full_w,
-                                  wrap_x=wrap_x), flow_dir / name, "RGB")
+        del sampled, coded
+        _write_sampled_color(mask_f, y0, x0, th, tw, full_h, full_w,
+                             mask_dir / name, wrap_x=wrap_x)
+        _write_sampled_color(flow_f, y0, x0, th, tw, full_h, full_w,
+                             flow_dir / name, wrap_x=wrap_x)
+        if detail_mode == "hierarchical":
+            gc.collect()
         with lock:
             state["done"] += 1
             done = state["done"]
@@ -591,6 +619,10 @@ def write_tiles(height, mask, flow, full_w, full_h, seed, dest,
     if max_workers < 1:
         raise ValueError("max_workers must be positive")
     workers = min(int(max_workers), os.cpu_count() or 2, total)
+    if detail_mode == "hierarchical":
+        # Each tile reruns erosion. Two of those at once is what exhausted
+        # memory partway through a 64K export.
+        workers = 1
     coords = [(ty, tx) for ty in range(tiles_y) for tx in range(tiles_x)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(lambda pair: one(*pair), coords))

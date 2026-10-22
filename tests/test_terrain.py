@@ -159,6 +159,19 @@ def test_noise_cells_are_square_on_a_wide_map():
     assert abs(y_lag - x_lag) <= max(2, 0.2 * max(y_lag, x_lag))
 
 
+def test_a_large_sample_matches_the_direct_one():
+    from terrain import grid, noise
+    y = np.linspace(0, 1000, 400)[:, None]
+    x = np.linspace(0, 400, 180)[None, :]
+    got = noise.value_noise_world(y, x, 80.0, 3, world_width_m=4000.0)
+    expect = noise._value_noise_world_full(y, x, 80.0, 3, world_width_m=4000.0)
+    np.testing.assert_array_equal(got, expect)
+    field = np.arange(12, dtype=np.float32).reshape(3, 4)
+    sampled = grid.sample_raster(field, y, x, 1000.0, 400.0, wrap_x=False)
+    direct = grid._sample_raster_full(field, y, x, 1000.0, 400.0, wrap_x=False)
+    np.testing.assert_array_equal(sampled, direct)
+
+
 def test_a_strong_warp_does_not_fold():
     from terrain import noise
     rng = np.random.default_rng(1)

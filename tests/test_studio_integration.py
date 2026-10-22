@@ -120,6 +120,20 @@ def test_hires_direct_and_tiles_identical(tmp_path, monkeypatch):
     assert Image.open(direct / "material_mask.png").mode == "RGBA"
 
 
+def test_upscaled_mask_softens_a_stepped_edge(tmp_path):
+    mask = np.zeros((24, 32, 4), np.float32)
+    y, x = np.mgrid[:24, :32]
+    mask[(y * 2 + x) > 28, 0] = 255
+    flow = np.zeros((24, 32, 3), np.float32)
+    height = np.zeros((24, 32), np.float32)
+    dest = tmp_path / "soft"
+    hires.write_direct(height, mask, flow, 96, 128, 1, dest,
+                       detail_fraction=0, wrap_x=False)
+    band = np.array(Image.open(dest / "material_mask.png"))[:, :, 0]
+    soft = np.logical_and(band > 8, band < 247).sum()
+    assert soft > 30
+
+
 def test_microdetail_shared_atlas_coordinates():
     b = hires.detail(0, 64, 16, 1, 64, 11, wrap_x=False, origin=(0, 0))
     a = hires.detail(0, 0, 16, 1, 64, 11, wrap_x=False, origin=(0, 64))
@@ -267,6 +281,68 @@ def test_export_writes_into_the_folder_the_user_picked(monkeypatch, tmp_path):
     assert seen["game"] == chosen
     assert seen["bundle"] == chosen
     assert not (tmp_path / "library").exists()
+
+
+def _atlas_tile(seed, height_value):
+    height = np.full((8, 12), height_value, np.float32)
+    mask = np.zeros((8, 12, 4), np.uint8)
+    flow = np.zeros((8, 12, 3), np.uint8)
+    color = np.zeros((8, 12, 3), np.uint8)
+    cfg = types.SimpleNamespace(
+        erosion_model="none", terrain_model="classic", wind_mode="belts",
+        depression_method="iterative", noise_backend="numpy",
+        world_width_m=1000.0, seed=seed,
+    )
+    made = {
+        "world": color, "height": color, "biomes": color, "canopy": color,
+        "material mask": mask[:, :, :3], "flow": flow, "_mask": mask,
+    }
+    return {
+        "world": types.SimpleNamespace(height=height, cfg=cfg),
+        "made": made,
+        "settings": {"seed": seed, "preset": "earthlike"},
+    }
+
+
+def test_export_is_the_whole_world_not_the_open_tile(monkeypatch, tmp_path):
+    gui = _mock_gui(monkeypatch)
+    monkeypatch.setattr(gui, "LIBRARY_TERRAIN", tmp_path / "library" / "terrain")
+    monkeypatch.setattr(gui, "BUNDLE_PARENT", tmp_path / "export")
+    called = {"bundle": False}
+
+    def bundle(*args, **kwargs):
+        called["bundle"] = True
+        raise AssertionError("a multi-tile world must not bundle only the open tile")
+
+    monkeypatch.setattr(gui.export, "bundle", bundle)
+    left = _atlas_tile(7, 0.0)
+    right = _atlas_tile(99, 3.0)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.events = queue.Queue()
+    studio.atlas = {(0, 0): left, (1, 0): right}
+    studio.tx, studio.ty = 1, 0
+    studio.world = right["world"]
+    studio.made = right["made"]
+    settings = dict(preset="earthlike", seed=99, detail_level="off",
+                    detail_mode="noise", advanced_export=True)
+    studio._export_worker(64, settings, False, tmp_path / "picked")
+    events = []
+    while not studio.events.empty():
+        events.append(studio.events.get_nowait())
+    errors = [ev[1] for ev in events if ev[0] == "error"]
+    assert not errors, errors
+    assert called["bundle"] is False
+    folders = list((tmp_path / "picked" / "hires").iterdir())
+    assert len(folders) == 1
+    folder = folders[0]
+    assert "x0_to_1" in folder.name and "y0_to_0" in folder.name
+    assert "seed99" not in folder.name
+    manifest = json.loads((folder / "manifest.json").read_text())
+    assert manifest["generator"]["tile"] == [0, 0]
+    assert {item["seed"] for item in manifest["generator"]["tiles"]} == {7, 99}
+    height = np.array(Image.open(folder / "height16.png"))
+    assert height.shape[1] > 64
+    assert height[:, : height.shape[1] // 2].mean() < height[:, height.shape[1] // 2 :].mean()
 
 
 def test_neighbor_atlas_exports_have_continuous_height(tmp_path):

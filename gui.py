@@ -173,6 +173,33 @@ def _surface(image):
     return pygame.surfarray.make_surface(np.ascontiguousarray(ordered))
 
 
+def _blit_scaled(screen, sheet, dest, clip):
+    """Draw `sheet` into `dest`. Only the visible part is scaled.
+
+    Scaling the whole atlas made a surface wider than the display can hold,
+    and that error closed the window.
+    """
+    visible = dest.clip(clip)
+    if visible.width < 1 or visible.height < 1:
+        return
+    sw, sh = sheet.get_size()
+    if sw < 1 or sh < 1 or dest.width < 1 or dest.height < 1:
+        return
+    if visible.size == dest.size and dest.width <= 4096 and dest.height <= 4096:
+        screen.blit(pygame.transform.smoothscale(sheet, dest.size), dest.topleft)
+        return
+    x0 = (visible.x - dest.x) * sw / dest.width
+    y0 = (visible.y - dest.y) * sh / dest.height
+    x1 = (visible.right - dest.x) * sw / dest.width
+    y1 = (visible.bottom - dest.y) * sh / dest.height
+    left = max(0, int(math.floor(x0)))
+    top = max(0, int(math.floor(y0)))
+    right = min(sw, max(left + 1, int(math.ceil(x1))))
+    bottom = min(sh, max(top + 1, int(math.ceil(y1))))
+    part = sheet.subsurface((left, top, right - left, bottom - top))
+    screen.blit(pygame.transform.smoothscale(part, (visible.width, visible.height)), visible.topleft)
+
+
 def _preview_height(stage, value):
     if stage not in HEIGHT_STAGES:
         return None
@@ -381,6 +408,36 @@ def stitch_atlas(tiles):
     return height, mask, flow, color, nx, ny
 
 
+def stitch_images(tiles):
+    """Place `(tx, ty, image)` on one sheet. Neighbouring tiles share their rim."""
+    usable = []
+    for tx, ty, image in tiles:
+        image = np.asarray(image)
+        if image.ndim < 2 or image.shape[0] < 2 or image.shape[1] < 2:
+            continue
+        usable.append((int(tx), int(ty), image))
+    if not usable:
+        return None
+    rows, cols = usable[0][2].shape[:2]
+    fitted = []
+    for tx, ty, image in usable:
+        if image.shape[:2] != (rows, cols):
+            image = _fit_plane(image, (rows, cols))
+        fitted.append((tx, ty, image))
+    txs = [tx for tx, _ty, _image in fitted]
+    tys = [ty for _tx, ty, _image in fitted]
+    tx0, ty0 = min(txs), min(tys)
+    nx = max(txs) - tx0 + 1
+    ny = max(tys) - ty0 + 1
+    sample = fitted[0][2]
+    out = np.zeros((ny * (rows - 1) + 1, nx * (cols - 1) + 1) + sample.shape[2:], sample.dtype)
+    for tx, ty, image in fitted:
+        y0 = (ty - ty0) * (rows - 1)
+        x0 = (tx - tx0) * (cols - 1)
+        out[y0:y0 + rows, x0:x0 + cols] = image
+    return out
+
+
 def _edge_strip(field, side, n=24):
     """Columns up to the shared edge, last column on the border."""
     if side == "left":
@@ -415,16 +472,23 @@ def _border_from(edges):
     return border
 
 
+def _shown_color(image, sigma):
+    """Soft edges for the on-screen mask. The stored mask stays the hard field."""
+    soft = export.feather_color(image, wrap_x=True, sigma=sigma)
+    return np.clip(np.rint(soft), 0, 255).astype(np.uint8)
+
+
 def assets_of(world):
     biome = render.layer(world, next(i for i, (name, _) in enumerate(render.LAYERS) if name == "biomes"))[1]
     canopy = render.layer(world, next(i for i, (name, _) in enumerate(render.LAYERS) if name == "canopy"))[1]
     mask = material_mask(world)
+    flow = flow_mask(world)
     return {
         "world": render.water_map(world).astype(np.uint8),
         "height": height_rgb(world),
         "biomes": biome,
-        "material mask": mask[:, :, :3],
-        "flow": flow_mask(world),
+        "material mask": _shown_color(mask, export.MASK_FEATHER)[:, :, :3],
+        "flow": _shown_color(flow, export.FLOW_FEATHER),
         "canopy": canopy,
         "_mask": mask,
     }
@@ -441,9 +505,13 @@ def write_game_copy(made, library_dir, world=None):
     _save_rgb(hires.downsample(made["height"], hires.GAME_MAX), library_dir / "zemia_height.png")
     if world is not None:
         export.heightmap(world.height, library_dir / "zemia_height16.png")
-    mask = hires.downsample(made["_mask"], hires.GAME_MAX)
-    Image.fromarray(np.ascontiguousarray(mask), "RGBA").save(library_dir / "material_mask.png")
-    _save_rgb(hires.downsample(made["flow"], hires.GAME_MAX), library_dir / "flow_mask.png")
+    mask = export.feather_color(hires.downsample(made["_mask"], hires.GAME_MAX),
+                                wrap_x=True, sigma=export.MASK_FEATHER)
+    Image.fromarray(np.clip(np.rint(mask), 0, 255).astype(np.uint8), "RGBA").save(
+        library_dir / "material_mask.png")
+    flow = export.feather_color(hires.downsample(made["flow"], hires.GAME_MAX),
+                                wrap_x=True, sigma=export.FLOW_FEATHER)
+    _save_rgb(np.clip(np.rint(flow), 0, 255).astype(np.uint8), library_dir / "flow_mask.png")
     _save_rgb(hires.downsample(made["world"], hires.PREVIEW_WIDTH), library_dir / "preview.png")
     return library_dir
 
@@ -1380,6 +1448,15 @@ class Studio:
             origin = (self.ty * h, self.tx * w)
             world_width_m = float(world.cfg.world_width_m)
             seed = int(world.cfg.seed)
+            keys = sorted(getattr(self, "atlas", None) or {})
+            whole = len(keys) > 1
+            if whole:
+                tx0 = min(tx for tx, _ty in keys)
+                tx1 = max(tx for tx, _ty in keys)
+                ty0 = min(ty for _tx, ty in keys)
+                ty1 = max(ty for _tx, ty in keys)
+                corner = (tx0, ty0) if (tx0, ty0) in self.atlas else keys[0]
+                seed = int(self.atlas[corner]["settings"]["seed"])
             if span is not None:
                 tiles = []
                 for (tx, ty), tile in self.atlas.items():
@@ -1391,23 +1468,33 @@ class Studio:
                     height, mask, flow, color, nx, ny = stitched
                     bed = type("Bed", (), {})()
                     bed.height = height
+                    biomes = stitch_images(
+                        (tx, ty, tile["made"]["biomes"])
+                        for (tx, ty), tile in self.atlas.items()
+                        if "biomes" in tile["made"])
+                    canopy = stitch_images(
+                        (tx, ty, tile["made"]["canopy"])
+                        for (tx, ty), tile in self.atlas.items()
+                        if "canopy" in tile["made"])
                     game_made = {
                         "height": height_rgb(bed),
                         "world": color,
                         "_mask": mask,
                         "flow": flow,
+                        "material mask": np.asarray(mask)[:, :, :3],
+                        "biomes": color if biomes is None else biomes,
+                        "canopy": color if canopy is None else canopy,
                     }
                     game_world = bed
                     origin = (0, 0)
                     tile_w, _tile_h = hires.map_size(width)
                     world_width_m = float(world.cfg.world_width_m) * (w / max(tile_w, 1))
                     span = (nx, ny)
-            if span is None:
-                stem = (f"{settings.get('preset', 'earthlike')}_seed{seed}_"
-                        f"{w}x{h}_x{self.tx}_y{self.ty}")
+            preset = settings.get("preset", "earthlike")
+            if whole:
+                stem = (f"{preset}_x{tx0}_to_{tx1}_y{ty0}_to_{ty1}_{w}x{h}")
             else:
-                stem = (f"{settings.get('preset', 'earthlike')}_seed{seed}_"
-                        f"atlas{span[0]}x{span[1]}_{w}x{h}")
+                stem = (f"{preset}_seed{seed}_{w}x{h}_x{self.tx}_y{self.ty}")
             if destination:
                 hires_parent = Path(destination) / "hires"
                 game_dir = Path(destination)
@@ -1421,9 +1508,13 @@ class Studio:
             while folder.exists():
                 folder = hires_parent / f"{stem}-{index}"
                 index += 1
-            self.events.put(("status", f"upscaling the generated tiles to {w}×{h}"))
+            if whole:
+                game_dir = folder
+            where = (f"the world x{tx0} to {tx1}, y{ty0} to {ty1}"
+                     if whole else f"{w}×{h}")
+            self.events.put(("status", f"upscaling {where} to {w}×{h}"))
             metadata = {
-                "preset": settings.get("preset", "earthlike"),
+                "preset": preset,
                 "erosion_model": world.cfg.erosion_model,
                 "terrain_model": world.cfg.terrain_model,
                 "detail_mode": settings.get("detail_mode", "noise"),
@@ -1431,12 +1522,13 @@ class Studio:
                 "depression_method": world.cfg.depression_method,
                 "noise_backend": world.cfg.noise_backend,
                 "simulation_seed": seed,
-                "tile": [self.tx, self.ty],
+                "tile": [tx0, ty0] if whole else [self.tx, self.ty],
             }
-            if span is not None:
+            if whole:
+                metadata["span"] = [tx1 - tx0 + 1, ty1 - ty0 + 1]
                 metadata["tiles"] = [
-                    {"x": tx, "y": ty, "seed": int(tile["settings"]["seed"])}
-                    for (tx, ty), tile in sorted(self.atlas.items())
+                    {"x": tx, "y": ty, "seed": int(self.atlas[(tx, ty)]["settings"]["seed"])}
+                    for tx, ty in keys
                 ]
             detail_fraction = DETAIL_AMPLITUDES[settings["detail_level"]]
             detail_mode = settings.get("detail_mode", "noise")
@@ -1460,18 +1552,27 @@ class Studio:
                     detail_fraction=detail_fraction, generator_info=metadata,
                     **atlas_sampling)
             game = write_game_copy(game_made, game_dir, world=game_world)
-            bundle = export.bundle(world, parent=bundle_parent,
-                                   advanced=settings["advanced_export"])
-            Image.fromarray(_rgb(hires.downsample(color, hires.PREVIEW_WIDTH)), "RGB").save(
-                bundle / "main_view.png")
-            note = (f"exported {w}×{h} to {folder.as_posix()}. "
-                    f"Game copy is in {game.as_posix()}. Bundle is {bundle.as_posix()}")
+            if whole:
+                # The seed bundle is one simulated tile. A world of several
+                # tiles is the stitched map, so that bundle would be only the
+                # tile that happened to be open.
+                bundle = folder
+                note = (f"exported the world x{tx0} to {tx1}, y{ty0} to {ty1} "
+                        f"({len(keys)} tiles) at {w}×{h} to {folder.as_posix()}")
+            else:
+                bundle = export.bundle(world, parent=bundle_parent,
+                                       advanced=settings["advanced_export"])
+                Image.fromarray(_rgb(hires.downsample(color, hires.PREVIEW_WIDTH)), "RGB").save(
+                    bundle / "main_view.png")
+                note = (f"exported {w}×{h} to {folder.as_posix()}. "
+                        f"Game copy is in {game.as_posix()}. Bundle is {bundle.as_posix()}")
             latest_pointer().write_text(json.dumps({
                 "bundle": str(bundle),
                 "hires": str(folder),
                 "game": str(game_dir),
             }, indent=1))
-            self.events.put(("exported", note, preview_thumbs(made), str(bundle), str(folder)))
+            shown = game_made if whole else made
+            self.events.put(("exported", note, preview_thumbs(shown), str(bundle), str(folder)))
         except Exception as err:
             self.events.put(("error", f"export failed: {err}"))
 
@@ -1553,13 +1654,11 @@ class Studio:
                 max(1, int(round(sheet.get_width() * z))),
                 max(1, int(round(sheet.get_height() * z))),
             )
-            if dest.colliderect(self.view):
-                self.screen.blit(pygame.transform.smoothscale(sheet, dest.size), dest.topleft)
+            _blit_scaled(self.screen, sheet, dest, self.view)
         if (self.live_surface is not None and self.live_cell is not None
                 and self.live_cell not in self.atlas):
             dest = self._tile_rect(*self.live_cell, mw, mh)
-            if dest.colliderect(self.view):
-                self.screen.blit(pygame.transform.smoothscale(self.live_surface, dest.size), dest.topleft)
+            _blit_scaled(self.screen, self.live_surface, dest, self.view)
         if self.atlas or self.live_cell is not None:
             dest = self._tile_rect(self.tx, self.ty, mw, mh)
             pygame.draw.rect(self.screen, ACCENT, dest, 1)
@@ -2036,8 +2135,7 @@ class Studio:
             mw, mh = surf.get_width(), surf.get_height()
             dest = pygame.Rect(int(self.view.x - self.cam[0] * z), int(self.view.y - self.cam[1] * z),
                                max(1, int(mw * z)), max(1, int(mh * z)))
-            if dest.colliderect(self.view):
-                self.screen.blit(pygame.transform.smoothscale(surf, dest.size), dest.topleft)
+            _blit_scaled(self.screen, surf, dest, self.view)
         self.screen.set_clip(None)
         if not showing_3d:
             self._draw_paint()
@@ -2413,7 +2511,14 @@ class Studio:
                         pass
                     elif self.image is not None:
                         self.zoom = float(np.clip(self.zoom * (1.12 ** event.y), 0.15, 12))
-            self.draw()
+            try:
+                self.draw()
+            except MemoryError:
+                pygame.display.set_caption("Terrain asset studio — out of memory")
+                self.status = "The view ran out of memory. Export keeps going if it already started."
+            except Exception as err:
+                pygame.display.set_caption("Terrain asset studio — view failed")
+                self.status = f"The view failed: {err}"
             self.clock.tick(60)
 
 if __name__ == "__main__":

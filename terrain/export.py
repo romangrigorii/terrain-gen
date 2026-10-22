@@ -38,7 +38,7 @@ def _write_png(path, a, depth, level=6):
         f.write(_chunk(b"IEND", b""))
 
 
-def _write_rgb_png(path, a):
+def _write_rgb_png(path, a, level=6):
     """Write RGB/RGBA 8-bit PNG without a runtime image dependency."""
     a = np.asarray(a)
     if a.dtype != np.uint8 or a.ndim != 3 or a.shape[2] not in (3, 4):
@@ -51,8 +51,38 @@ def _write_rgb_png(path, a):
     with open(path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n")
         f.write(_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, color_type, 0, 0, 0)))
-        f.write(_chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)))
+        f.write(_chunk(b"IDAT", zlib.compress(raw.tobytes(), int(level))))
         f.write(_chunk(b"IEND", b""))
+
+
+# Feather is in preview pixels. One preview pixel becomes about a hundred
+# pixels at 64K, so a hard biome edge stays a staircase unless it is rounded
+# here before the upscale.
+MASK_FEATHER = 1.5
+FLOW_FEATHER = 1.0
+
+
+def feather_color(image, wrap_x=True, sigma=MASK_FEATHER):
+    """Round stepped color edges. A flat field stays flat."""
+    image = np.asarray(image, np.float32)
+    sigma = float(sigma)
+    if sigma <= 0 or image.ndim < 2 or min(image.shape[:2]) < 2:
+        return image
+
+    def plane(field):
+        if wrap_x and field.shape[1] > 1:
+            pad = max(1, int(np.ceil(sigma * 3.0)))
+            wide = np.concatenate((field[:, -pad:], field, field[:, :pad]), axis=1)
+            wide = scipy.ndimage.gaussian_filter(wide, sigma=(0.0, sigma), mode="nearest")
+            field = wide[:, pad:-pad]
+        else:
+            field = scipy.ndimage.gaussian_filter(field, sigma=(0.0, sigma), mode="nearest")
+        field = scipy.ndimage.gaussian_filter(field, sigma=(sigma, 0.0), mode="nearest")
+        return np.asarray(field, np.float32)
+
+    if image.ndim == 2:
+        return plane(image)
+    return np.stack([plane(image[..., c]) for c in range(image.shape[-1])], axis=-1)
 
 
 def advanced_bundle(world, folder, include_fields=True):
@@ -62,9 +92,10 @@ def advanced_bundle(world, folder, include_fields=True):
     d.mkdir(parents=True, exist_ok=True)
     n = derived.normals(world.height)
     _write_rgb_png(d / "normals.png", np.rint(np.clip(n * 0.5 + 0.5, 0, 1) * 255).astype(np.uint8))
-    mat = derived.material_weights(world)
-    _write_rgb_png(d / "materials.png", np.rint(mat * 255).astype(np.uint8))
-    field8(derived.wetness(world), d / "wetness.png", units="relative surface wetness")
+    mat = feather_color(derived.material_weights(world), wrap_x=True, sigma=MASK_FEATHER)
+    _write_rgb_png(d / "materials.png", np.rint(np.clip(mat, 0, 1) * 255).astype(np.uint8))
+    wet = feather_color(derived.wetness(world), wrap_x=True, sigma=FLOW_FEATHER)
+    field8(np.clip(wet, 0, 1), d / "wetness.png", units="relative surface wetness")
     (d / "materials.json").write_text(json.dumps({
         "channels": ["sand", "soil_grass", "rock", "snow"],
         "encoding": "unorm8_rgba", "land_sum": 1.0,
