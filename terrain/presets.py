@@ -10,8 +10,10 @@ PRESETS = {
     },
     "archipelago": {
         "description": "More coastlines, island chains and marine terrain.",
-        "values": {"land_fraction": 0.18, "cont_fraction": 0.24,
-                   "cont_plate_fraction": 0.25, "n_hotspots": 16,
+        "values": {"land_fraction": 0.15, "cont_fraction": 0.22,
+                   "cont_plate_fraction": 0.25, "n_plates": 28,
+                   "geography": "dispersed", "crust_features": 36,
+                   "crust_periods": 4.0, "n_hotspots": 16,
                    "hotspot_h": 1.22, "coast_h": 0.20},
     },
     "supercontinent": {
@@ -38,6 +40,19 @@ PRESETS = {
         "values": {"n_hotspots": 25, "hotspot_h": 1.5,
                    "hotspot_sigma": 2.6, "arc_h": 1.15,
                    "ridge_h": 0.38, "land_fraction": 0.26},
+    },
+    "ocean": {
+        "description": "A deep ocean world. Land stays unconstrained, and there is no polar sink.",
+        "values": {"land_fraction": 0.10, "cont_fraction": 0.16,
+                   "n_plates": 24, "geography": "free",
+                   "crust_features": 32, "ocean_base": -1.05,
+                   "crust_periods": 3.2},
+    },
+    "polar": {
+        "description": "High-latitude continents, placed there on purpose. No polar elevation penalty.",
+        "values": {"land_fraction": 0.35, "cont_fraction": 0.42,
+                   "n_plates": 12, "geography": "poles",
+                   "crust_features": 8, "crust_periods": 1.2},
     },
 }
 

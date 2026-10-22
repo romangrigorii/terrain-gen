@@ -33,6 +33,92 @@ def _rank(vals, pool, n=20000):
     return np.searchsorted(s, vals, side="right") / len(s)
 
 
+def _cell_noise(shape, seed):
+    """Stable value in -1..1 for each cell. Smooth it before using it as an edge."""
+    y, x = np.indices(shape)
+    n = (y.astype(np.int64) * np.int64(374761393)
+         + x.astype(np.int64) * np.int64(668265263)
+         + np.int64(seed)) & np.int64(0xFFFFFFFF)
+    n ^= n >> np.int64(13)
+    n = (n * np.int64(1274126177)) & np.int64(0xFFFFFFFF)
+    return n.astype(np.float32) * np.float32(2.0 / 4294967295.0) - np.float32(1.0)
+
+
+def _smoother(t):
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+
+def _sway(shape, seed, smooth=1.8):
+    """Smooth noise brought back to about -1..1. Blur alone would flatten it."""
+    field = grid.blur(_cell_noise(shape, int(seed)), float(smooth))
+    scale = float(np.percentile(np.abs(field), 90))
+    if scale < 1e-6:
+        return field
+    return np.clip(field / np.float32(scale), -1.0, 1.0).astype(np.float32)
+
+
+def _shore_mix(h, seed=11, reach=3.4):
+    """1 inland, 0 at sea. The join wanders, so the shore is not a cell staircase.
+
+    The shared rim keeps the hard cut. A neighbor tile paints that same pixel.
+    """
+    h = np.asarray(h, np.float64)
+    gy, gx = grid.gradient(h)
+    slope = np.maximum(np.hypot(gy, gx), 1e-6)
+    shifted = h + _sway(h.shape, seed) * slope * float(reach)
+    mix = _smoother(shifted / (slope * 1.35) + 0.5).astype(np.float32)
+    hard = (h > 0.0).astype(np.float32)
+    mix[0, :] = hard[0, :]
+    mix[-1, :] = hard[-1, :]
+    mix[:, 0] = hard[:, 0]
+    mix[:, -1] = hard[:, -1]
+    return mix
+
+
+def _fray_labels(ids, seed, reach=4.5):
+    """Move a colour boundary off the grid. Cells far from a border stay put."""
+    ids = np.asarray(ids)
+    edge = np.zeros(ids.shape, dtype=bool)
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        edge |= grid.shift(ids, dy, dx) != ids
+    if not edge.any():
+        return ids
+    dist = grid.edt(~edge)
+    fade = np.clip(1.0 - dist / (float(reach) + 1.0), 0.0, 1.0).astype(np.float32)
+    near = fade > 0.0
+    rows, cols = ids.shape
+    yy = np.arange(rows, dtype=np.float32)[:, None]
+    xx = np.arange(cols, dtype=np.float32)[None, :]
+    sway_y = _sway(ids.shape, seed, smooth=2.4)
+    sway_x = _sway(ids.shape, seed + 29, smooth=2.4)
+    sy = np.clip(np.rint(yy + sway_y * float(reach) * fade), 0, rows - 1).astype(np.int32)
+    sx = np.mod(np.rint(xx + sway_x * float(reach) * fade).astype(np.int32), cols)
+    picked = ids[sy, sx]
+    same = ((picked == 0) == (ids == 0)) & near
+    out = np.array(ids, copy=True)
+    out[same] = picked[same]
+    out[0, :] = ids[0, :]
+    out[-1, :] = ids[-1, :]
+    out[:, 0] = ids[:, 0]
+    out[:, -1] = ids[:, -1]
+    return out
+
+
+def _ragged_cover(mask, seed, reach=3.2, sigma=0.85):
+    """Warp a binary mask so its outline is a curve, then soften that curve."""
+    mask = np.asarray(mask, np.float32)
+    rows, cols = mask.shape
+    yy = np.arange(rows, dtype=np.float32)[:, None]
+    xx = np.arange(cols, dtype=np.float32)[None, :]
+    sy = np.clip(np.rint(yy + _sway(mask.shape, seed) * float(reach)), 0, rows - 1).astype(np.int32)
+    sx = np.mod(np.rint(xx + _sway(mask.shape, int(seed) + 17) * float(reach)).astype(np.int32), cols)
+    warped = mask[sy, sx]
+    if sigma <= 0:
+        return warped
+    return grid.blur(warped, float(sigma))
+
+
 def hypsometric(h, land_mix=0.35, sea_mix=0.22):
     """Blue below sea level, green-to-white above, each side scaled separately."""
     land_v, sea_v = h[h > 0], h[h < 0]
@@ -42,7 +128,8 @@ def hypsometric(h, land_mix=0.35, sea_mix=0.22):
                 sea_mix * (1 - _rank(h, sea_v)), SEA_RAMP)
     land = _ramp((1 - land_mix) * np.clip(h / land_scale, 0, 1) +
                  land_mix * _rank(h, land_v), LAND_RAMP)
-    return np.where((h > 0)[..., None], land, sea)
+    mix = _shore_mix(h)[..., None]
+    return sea * (1.0 - mix) + land * mix
 
 
 def hillshade(h, azimuth=315.0, altitude=45.0, z=28.0):
@@ -59,11 +146,13 @@ def hillshade(h, azimuth=315.0, altitude=45.0, z=28.0):
 def relief(h, shade=True, surface=None, tint=None, tint_mix=0.0):
     """Hypsometric tint of the bed, hillshaded off `surface` if water sits on it."""
     rgb = hypsometric(h)
+    shore = _shore_mix(h)[..., None]
     if tint is not None and tint_mix > 0:
-        rgb = np.where((h > 0)[..., None], rgb * (1 - tint_mix) + tint * tint_mix, rgb)
+        gain = float(tint_mix) * shore
+        rgb = rgb * (1.0 - gain) + tint * gain
     if shade:
         s = hillshade(h if surface is None else surface)[..., None]
-        lit = np.where((h > 0)[..., None], 0.55 + 0.75 * s, 0.82 + 0.28 * s)
+        lit = (0.82 + 0.28 * s) * (1.0 - shore) + (0.55 + 0.75 * s) * shore
         rgb = np.clip(rgb * lit, 0, 255)
     return rgb
 
@@ -79,10 +168,13 @@ def overpaint_water(rgb, w):
         soft = grid.blur(wat.lake_depth, LAKE_DEPTH_BLUR)
         d = np.clip(soft / max(1e-6, float(np.percentile(
             soft[wat.lake_mask], 92))), 0, 1)
-        rgb = np.where(wat.lake_mask[..., None], _ramp(d, LAKE_RAMP), rgb)
+        cover = _ragged_cover(wat.lake_mask, seed=int(w.cfg.seed) + 23)[..., None]
+        rgb = rgb * (1.0 - cover) + _ramp(d, LAKE_RAMP) * cover
     if wat.river_mask.any():
         v = np.clip(wat.width / max(1e-6, w.cfg.river_width_max), 0, 1)
-        rgb = np.where(wat.river_mask[..., None], _ramp(v, RIVER_RAMP), rgb)
+        cover = _ragged_cover(wat.river_mask, seed=int(w.cfg.seed) + 47,
+                              reach=1.4, sigma=0.65)[..., None]
+        rgb = rgb * (1.0 - cover) + _ramp(v, RIVER_RAMP) * cover
     return rgb
 
 
@@ -200,12 +292,13 @@ BIOME_COLORS = np.array([
 
 
 def biome_rgb(w, soften=None):
-    """Per-cell biome colour, sea left as the hypsometric ramp will paint it."""
-    rgb = BIOME_COLORS[w.biome]
+    """Biome colour. Borders wander off the cell grid; sea stays for the ramp."""
+    land_ids = np.where(w.land, w.biome, 0)
+    rgb = BIOME_COLORS[_fray_labels(land_ids, seed=int(w.cfg.seed) + 41)]
     s = w.cfg.biome_soften if soften is None else soften
     if s <= 0:
         return rgb
-    m = w.land.astype(float)
+    m = _shore_mix(w.height, seed=int(w.cfg.seed) + 7)
     num = np.stack([grid.blur(rgb[..., c] * m, s) for c in range(3)], axis=-1)
     return num / np.maximum(grid.blur(m, s), 1e-6)[..., None]
 
@@ -213,8 +306,9 @@ def biome_rgb(w, soften=None):
 def biome_map(w):
     """Flat biome colour, hillshaded, with the water drawn back over it."""
     rgb = biome_rgb(w)
-    rgb = np.where(w.land[..., None], rgb * (0.78 + 0.38 * hillshade(w.height)[..., None]),
-                   hypsometric(w.height))
+    shore = _shore_mix(w.height, seed=int(w.cfg.seed) + 7)[..., None]
+    lit = rgb * (0.78 + 0.38 * hillshade(w.height)[..., None])
+    rgb = hypsometric(w.height) * (1.0 - shore) + lit * shore
     return np.clip(overpaint_water(rgb, w), 0, 255).astype(np.uint8)
 
 LEGEND_COLORS = np.array([
@@ -330,14 +424,14 @@ def biome_edges(w):
 
 
 def legend_biome_map(w):
-    """One colour per biome, bordered, with a key to read them by."""
-    rgb = np.where(w.land[..., None], LEGEND_COLORS[w.biome] *
-                   (0.86 + 0.24 * hillshade(w.height)[..., None]),
-                   hypsometric(w.height))
+    """One colour per biome, with a ragged join, and a key to read them by."""
+    land_ids = np.where(w.land, w.biome, 0)
+    colours = LEGEND_COLORS[_fray_labels(land_ids, seed=int(w.cfg.seed) + 41)]
+    lit = colours * (0.86 + 0.24 * hillshade(w.height)[..., None])
+    shore = _shore_mix(w.height, seed=int(w.cfg.seed) + 7)[..., None]
+    rgb = hypsometric(w.height) * (1.0 - shore) + lit * shore
     rgb = overpaint_water(rgb, w)
-    a = (biome_edges(w) * BORDER_A)[..., None]
-    rgb = np.clip(rgb * (1 - a) + BORDER * a, 0, 255)
-    return draw_legend(rgb, present_biomes(w), w.land).astype(np.uint8)
+    return draw_legend(np.clip(rgb, 0, 255), present_biomes(w), w.land).astype(np.uint8)
 
 TEMP_RAMP = [(-30.0, (78, 96, 168)), (-10.0, (120, 168, 208)),
              (0.0, (226, 234, 240)), (12.0, (232, 206, 132)),

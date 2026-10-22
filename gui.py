@@ -14,8 +14,6 @@ import hires
 from terrain import Config, climate, export, generate, grid, render
 from terrain.elevation import paint_relief, sculpt_grain
 from terrain.presets import PRESETS, make_config
-from terrain.v2.generation.editor import PROCESSES, ScenarioEditor
-from terrain.v2.generation.preview import shade_state
 from terrain.view3d import load_surface, mark_strokes, pan_delta, stitch_tiles
 from terrain.world import meet_border
 
@@ -44,12 +42,6 @@ OPTION_CAPTIONS = {
     "detail_mode": "Hi-res",
 }
 DETAIL_AMPLITUDES = {"off": 0.0, "low": 0.01, "medium": 0.02, "high": 0.04}
-PROCESS_LABELS = {
-    "glacial": "Ice",
-    "aeolian": "Dunes",
-    "coastal": "Coast",
-    "karst": "Caves",
-}
 PAINT_TOOLS = ("mountain", "valley", "glacial", "dune", "coast", "cave")
 ASSET_RANGE = {
     "glacial": ("ice", 40, 1600),
@@ -457,6 +449,10 @@ class Slider:
                     (self.rect.x, self.rect.y - 18))
 
 
+class PreviewCancelled(Exception):
+    """A newer preview replaced the one this worker is still building."""
+
+
 class Button:
     def __init__(self, label, width=120):
         self.label = label
@@ -630,19 +626,6 @@ class Studio:
         self.live_surface = None
         self.preset_dirty = True
         self._seed_from = (0, 0)
-        self.scenario = ScenarioEditor("temperate")
-        self.sc_temp = Slider("scenario temp", -30, 40,
-                              int(round(self.scenario.get("temperature_c"))),
-                              fmt=lambda v: f"{v:+d} C")
-        self.sc_rain = Slider("scenario rain", 0, 20,
-                              int(round(self.scenario.get("rainfall_mm_day"))),
-                              fmt=lambda v: f"{v} mm")
-        self.sc_hard = Slider("scenario rock", 0, 100,
-                              int(round(self.scenario.get("hardness") * 100)),
-                              fmt=lambda v: f"{v}% hard")
-        self.scenario_btn = Button("", 252)
-        self.run_scenario_btn = Button("Run scenario", 252)
-        self.process_btns = {name: Button(PROCESS_LABELS[name], 60) for name in PROCESSES}
         self._fit_when_done = True
         self.busy = False
         self.status = ("Generate a preview. M mountain, V valley, I ice, G dunes, "
@@ -683,47 +666,11 @@ class Studio:
         self._undo_stack = []
         self._generate_rest = []
         self._inflight_sculpt = None
+        self._preview_token = 0
+        self._preview_cancel = threading.Event()
         self.painting = None
         self.pointer = None
         self.sculpt_bar = pygame.Rect(0, 0, 0, 0)
-
-    def _sync_scenario_sliders(self):
-        self.sc_temp.value = int(round(self.scenario.get("temperature_c")))
-        self.sc_rain.value = int(round(self.scenario.get("rainfall_mm_day")))
-        self.sc_hard.value = int(round(self.scenario.get("hardness") * 100))
-
-    def _push_scenario_sliders(self):
-        self.scenario.set("temperature_c", self.sc_temp.value)
-        self.scenario.set("rainfall_mm_day", self.sc_rain.value)
-        self.scenario.set("hardness", self.sc_hard.value / 100.0)
-
-    def start_scenario(self):
-        if self.busy:
-            return
-        try:
-            seed = int(self.seed_text)
-        except ValueError:
-            self.status = "Seed needs to be a whole number."
-            return
-        self._push_scenario_sliders()
-        self.busy = True
-        self.job = "scenario"
-        self.progress.begin("Scenario", (("landscape", 1),))
-        self.status = f"running {self.scenario.name}"
-        threading.Thread(
-            target=self._scenario_worker,
-            args=(self.scenario.name, self.scenario.overrides(), seed),
-            daemon=True,
-        ).start()
-
-    def _scenario_worker(self, name, overrides, seed):
-        try:
-            from terrain.v2 import run
-            state = run(name, shape=(48, 64), cell_m=90.0, seed=int(seed), passes=2,
-                        dt_years=80.0, overrides=overrides)
-            self.events.put(("scenario", shade_state(state), name))
-        except Exception as err:
-            self.events.put(("error", f"scenario failed: {err}"))
 
     def settings(self):
         return dict(
@@ -884,9 +831,30 @@ class Studio:
                                if other != cell and not self._strokes_baked(other)]
         self._launch(cell)
 
+    def cancel_preview(self):
+        """Stop the preview in progress. Tiles already finished stay on the map."""
+        if not self.busy or self.job != "preview":
+            return
+        self._preview_cancel.set()
+        self._preview_token += 1
+        self._generate_rest = []
+        self._inflight_sculpt = None
+        self.live_surface = None
+        self.live_cell = None
+        self.progress.stop()
+        self.busy = False
+        self.job = None
+        self.export_btn.enabled = self.world is not None
+        self.status = "Generation stopped. Pan to a tile, then click Generate preview."
+        self._release_map()
+
     def _launch(self, cell, keep=False):
         self.busy = True
         self.job = "preview"
+        self._preview_token += 1
+        self._preview_cancel = threading.Event()
+        token = self._preview_token
+        cancel = self._preview_cancel
         self.export_btn.enabled = False
         self.image_name = "world"
         self.tx, self.ty = cell
@@ -908,8 +876,10 @@ class Studio:
         cfg = config_from_settings(settings, pw, ph)
         sculpt = self._sculpt_payload(cell)
         self._inflight_sculpt = (cell, self._freeze_strokes(sculpt))
-        threading.Thread(target=self._worker, args=(cfg, edges, settings, cell, sculpt),
-                         daemon=True).start()
+        threading.Thread(
+            target=self._worker,
+            args=(cfg, edges, settings, cell, sculpt, token, cancel),
+            daemon=True).start()
 
     def _preset_for(self, tx, ty):
         """Sliders are the preset. An untouched seed changes per cell so the interior is a new world rather than a copy of the neighbor."""
@@ -985,13 +955,20 @@ class Studio:
             tile["made"]["world"] = rgb
             tile["surface"] = _surface(rgb)
 
-    def _worker(self, cfg, edges, settings, cell, sculpt=None):
+    def _worker(self, cfg, edges, settings, cell, sculpt=None, token=None, cancel=None):
         border = _border_from(edges)
 
+        def abandon():
+            return cancel is not None and cancel.is_set()
+
         def on_stage(name):
-            self.events.put(("stage", name))
+            if abandon():
+                raise PreviewCancelled()
+            self.events.put(("stage", name, token))
 
         def on_preview(name, value):
+            if abandon():
+                raise PreviewCancelled()
             if border and name not in ("coastline", "erosion", "rivers", "placed"):
                 return
             if border:
@@ -1000,28 +977,42 @@ class Studio:
                     shown = meet_border(height, border)
                     shown = hires.downsample(shown, hires.PREVIEW_WIDTH)
                     self.events.put(("cell_image", cell,
-                                     render.relief(shown).astype(np.uint8)))
+                                     render.relief(shown).astype(np.uint8), token))
                     return
             image = _preview_height(name, value)
             if image is not None:
-                self.events.put(("cell_image", cell, image))
+                self.events.put(("cell_image", cell, image, token))
 
         try:
+            if abandon():
+                return
             if border:
                 level = float(np.mean([np.mean(edge["height"]) for edge in edges]))
                 canvas = np.full((cfg.height, cfg.width), level, np.float32)
                 self.events.put(("cell_image", cell,
-                                 render.relief(meet_border(canvas, border)).astype(np.uint8)))
+                                 render.relief(meet_border(canvas, border)).astype(np.uint8),
+                                 token))
             world = generate(cfg, verbose=False, on_stage=on_stage,
                              on_preview=on_preview, border=border, sculpt=sculpt or None,
                              sculpt_at=cell)
-            self.events.put(("stage", "maps"))
+            if abandon():
+                return
+            self.events.put(("stage", "maps", token))
             made = assets_of(world)
             made["_plain"] = np.array(made["world"], copy=True)
-        except Exception as err:
-            self.events.put(("error", f"generation failed: {err}"))
+        except PreviewCancelled:
             return
-        self.events.put(("done", world, made, settings, cell))
+        except Exception as err:
+            if abandon():
+                return
+            self.events.put(("error", f"generation failed: {err}", token))
+            return
+        if abandon():
+            return
+        self.events.put(("done", world, made, settings, cell, token))
+
+    def _preview_current(self, token):
+        return token is None or token == self._preview_token
 
     def pump(self):
         try:
@@ -1031,6 +1022,8 @@ class Studio:
                 if kind == "status":
                     self.status = event[1]
                 elif kind == "stage":
+                    if len(event) > 2 and not self._preview_current(event[2]):
+                        continue
                     self.progress.advance(event[1])
                     self.status = event[1]
                 elif kind == "tiles":
@@ -1039,6 +1032,8 @@ class Studio:
                     if done == total or done % 8 == 0:
                         self.status = f"writing tiles {done}/{total}"
                 elif kind == "cell_image":
+                    if len(event) > 3 and not self._preview_current(event[3]):
+                        continue
                     cell, image = event[1], event[2]
                     if self.job == "preview" and cell == (self.tx, self.ty):
                         self.live_cell = cell
@@ -1054,6 +1049,8 @@ class Studio:
                                    ("world", "height", "biomes", "material mask", "flow", "canopy")}
                     self._set_image("world", made["world"], fit=True)
                 elif kind == "done":
+                    if len(event) > 5 and not self._preview_current(event[5]):
+                        continue
                     world, made, settings, cell = event[1], event[2], event[3], event[4]
                     self.live_surface = None
                     self.live_cell = None
@@ -1085,14 +1082,6 @@ class Studio:
                             paint = "  paint changed since this build"
                         self.status = (f"tile {cell[0]},{cell[1]}  {w}×{h}  "
                                        f"land {world.land.mean():.0%}  seed {settings['seed']}{paint}")
-                elif kind == "scenario":
-                    image, name = event[1], event[2]
-                    self.progress.complete()
-                    self.busy = False
-                    self.job = None
-                    self._set_image("scenario", image, fit=True)
-                    self.status = (f"{name}. Pale ground is ice, tan is sand, "
-                                   "darker spots are caves.")
                 elif kind == "exported":
                     self.progress.complete()
                     self.busy = False
@@ -1102,6 +1091,8 @@ class Studio:
                     self.thumbs = event[2]
                     self._set_image("world", self.thumbs["world"], fit=True)
                 elif kind == "error":
+                    if len(event) > 2 and not self._preview_current(event[2]):
+                        continue
                     self.progress.stop()
                     self._inflight_sculpt = None
                     self._generate_rest = []
@@ -1176,7 +1167,8 @@ class Studio:
             self._show_cell(self.tx, self.ty, fit=True)
             return
         self.fit()
-        self.start()
+        self.status = (f"Tile {self.tx},{self.ty} is empty. "
+                       "Click Generate preview to build it.")
 
     def _cell_under_center(self):
         if not self.atlas:
@@ -1204,7 +1196,8 @@ class Studio:
             self._seed_from = (self.tx, self.ty)
             self.tx, self.ty = cell
             self._fit_when_done = False
-            self.start()
+            self.status = (f"Tile {cell[0]},{cell[1]} is empty. "
+                           "Click Generate preview to build it.")
 
     def export(self):
         if self.world is None or self.busy:
@@ -1433,7 +1426,7 @@ class Studio:
             pygame.draw.rect(self.screen, LINE, dest, 1)
             if self.live_surface is not None and (tx, ty) == self.live_cell:
                 continue
-            word = "generating" if self.busy and (tx, ty) == (self.tx, self.ty) else "drag to extend"
+            word = "generating" if self.busy and (tx, ty) == (self.tx, self.ty) else "click Generate"
             img = self.small.render(word, True, MUTED)
             self.screen.blit(img, img.get_rect(center=dest.center))
         made = self._map_sheet()
@@ -1951,8 +1944,6 @@ class Studio:
             note = "Drag along a shoreline. Generate preview cuts it and leaves a beach."
         elif self.tool == "cave":
             note = "Drag a cave. Generate preview opens a hollow there."
-        elif self.image_name == "scenario":
-            note = "Scenario preview. Pale ground is ice, tan is sand, darker spots are caves."
         elif self._paint_pending():
             note = f"tile {self.tx},{self.ty}   paint is waiting — Generate preview rebuilds it"
         else:
@@ -2008,44 +1999,15 @@ class Studio:
             button.draw(self.screen, self.small)
             y += 32
         y += 4
-        self.screen.blit(self.small.render("landscape scenario", True, MUTED), (16, y))
-        y += 18
-        self.scenario_btn.rect.topleft = (16, y)
-        self.scenario_btn.label = f"Scenario: {self.scenario.name}  >"
-        self.scenario_btn.enabled = not self.busy
-        self.scenario_btn.draw(self.screen, self.small)
-        y += 32
-        y = self._wrapped(self.scenario.summary(), 16, y, 252)
-        y += 4
-        for slider in (self.sc_temp, self.sc_rain, self.sc_hard):
-            slider.rect.topleft = (16, y + 18)
-            slider.rect.w = 248
-            slider.draw(self.screen, self.small)
-            y += 48
-        x = 16
-        for name, button in self.process_btns.items():
-            button.rect = pygame.Rect(x, y, 60, 28)
-            button.label = PROCESS_LABELS[name]
-            button.enabled = not self.busy
-            button.draw(self.screen, self.small, hot=self.scenario.processes[name])
-            x += 64
-        y += 36
-        self.run_scenario_btn.rect.topleft = (16, y)
-        self.run_scenario_btn.label = ("Running scenario..."
-                                       if self.busy and self.job == "scenario"
-                                       else "Run scenario")
-        self.run_scenario_btn.enabled = not self.busy
-        self.run_scenario_btn.draw(self.screen, self.font)
-        y += 40
         self.advanced_btn.rect.topleft = (16, y)
         self.advanced_btn.label = f"Advanced layers: {'on' if self.advanced_export else 'off'}  >"
         self.advanced_btn.enabled = not self.busy
         self.advanced_btn.draw(self.screen, self.small)
         y += 38
         self.generate_btn.rect.topleft = (16, y)
-        self.generate_btn.enabled = not self.busy
+        self.generate_btn.enabled = not self.busy or self.job == "preview"
         if self.busy and self.job == "preview":
-            self.generate_btn.label = "Generating..."
+            self.generate_btn.label = "Cancel"
         elif self._paint_pending():
             self.generate_btn.label = "Rebuild with paint"
         else:
@@ -2143,9 +2105,8 @@ class Studio:
         if in_panel and self.seed_box.collidepoint(pos):
             return
         if in_panel and any(slider.rect.inflate(0, 10).collidepoint(pos) for slider in
-               (self.plates, self.land, self.temp, self.sc_temp, self.sc_rain, self.sc_hard)):
-            slider = next(s for s in (self.plates, self.land, self.temp,
-                                      self.sc_temp, self.sc_rain, self.sc_hard)
+               (self.plates, self.land, self.temp)):
+            slider = next(s for s in (self.plates, self.land, self.temp)
                           if s.rect.inflate(0, 10).collidepoint(pos))
             slider.grabbed = True
             slider.set_from(pos[0])
@@ -2164,22 +2125,10 @@ class Studio:
                 self.advanced_export = not self.advanced_export
                 self.status = "Advanced layers are now " + ("on" if self.advanced_export else "off")
                 return
-            if self.scenario_btn.enabled and self.scenario_btn.rect.collidepoint(pos):
-                self.scenario.cycle()
-                self._sync_scenario_sliders()
-                self.status = self.scenario.summary()
-                return
-            for name, button in self.process_btns.items():
-                if button.enabled and button.rect.collidepoint(pos):
-                    self.scenario.toggle(name)
-                    label = PROCESS_LABELS[name]
-                    state = "on" if self.scenario.processes[name] else "off"
-                    self.status = f"{label} is {state} for {self.scenario.name}."
-                    return
-            if self.run_scenario_btn.enabled and self.run_scenario_btn.rect.collidepoint(pos):
-                self.start_scenario()
-                return
             if self.generate_btn.rect.collidepoint(pos):
+                if self.busy and self.job == "preview":
+                    self.cancel_preview()
+                    return
                 self._seed_from = (self.tx, self.ty)
                 self._fit_when_done = True
                 self.preset_dirty = True
@@ -2240,6 +2189,9 @@ class Studio:
             self.seed_text = self.seed_text[:-1]
             self.preset_dirty = True
         elif event.key == pygame.K_RETURN:
+            if self.busy and self.job == "preview":
+                self.cancel_preview()
+                return
             self._seed_from = (self.tx, self.ty)
             self._fit_when_done = True
             self.preset_dirty = True
@@ -2282,10 +2234,6 @@ class Studio:
                         if slider.grabbed:
                             self.preset_dirty = True
                         slider.grabbed = False
-                    for slider in (self.sc_temp, self.sc_rain, self.sc_hard):
-                        if slider.grabbed:
-                            self._push_scenario_sliders()
-                        slider.grabbed = False
                     for slider in (self.relief_m, self.brush):
                         if slider.grabbed:
                             self._store_relief()
@@ -2298,7 +2246,6 @@ class Studio:
                 if event.type == pygame.MOUSEMOTION:
                     self.pointer = event.pos
                     grabbed = next((s for s in (self.plates, self.land, self.temp,
-                                                self.sc_temp, self.sc_rain, self.sc_hard,
                                                 self.relief_m, self.brush) if s.grabbed), None)
                     if grabbed:
                         grabbed.set_from(event.pos[0])

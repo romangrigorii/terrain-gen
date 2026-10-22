@@ -411,6 +411,10 @@ def _validate_config(cfg):
         raise ValueError("sediment_iters must be nonnegative")
     if cfg.terrain_model not in ("classic", "layered", "full"):
         raise ValueError("terrain_model must be classic, layered or full")
+    if cfg.geography not in ("free", "poles", "dispersed"):
+        raise ValueError("geography must be free, poles or dispersed")
+    if cfg.crust_features < 1:
+        raise ValueError("crust_features must be positive")
 
 
 def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, border=None,
@@ -446,7 +450,11 @@ def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, border=None
     raw = stage("hotspots", lambda: elevation.hotspot_chains(raw, tect, cfg, rng))
     pre = stage("texture", lambda: elevation.texture(raw.copy(), tect, cfg, rng))
 
-    level = float(np.quantile(pre, 1.0 - cfg.land_fraction))
+    # Plates and crust are finished. Sea level is a share of the sphere.
+    # Rain is computed next so erosion has a climate, then temperature and
+    # biomes are computed again on the eroded surface. Latitude drives that
+    # climate. It does not decide where the crust is.
+    level = grid.area_quantile(pre, 1.0 - cfg.land_fraction)
     raw -= level
     pre -= level
     def coastline():

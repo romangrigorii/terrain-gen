@@ -21,6 +21,8 @@ class Config:
     plate_warp_periods: int = 3
     plate_size_var: float = 0.42    # 0 = all plates the same size
     cont_plate_fraction: float = 0.42
+    geography: str = "free"         # free | poles | dispersed; never a polar sink
+    crust_features: int = 24        # spherical blobs in the continental potential
     stress_blur: float = 2.0        # smoothing of the raw strain derivatives
     stress_spread: float = 5.0      # softens medial-axis rays after propagation
     conv_gate: tuple = (0.18, 0.48)
@@ -39,9 +41,9 @@ class Config:
     crust_sharpness: float = 0.85    # higher -> narrower shelves, steeper margins
     upland_h: float = 0.30
     upland_periods: float = 3.0
-    polar_start: float = 0.56       # |latitude| where crust starts thinning
-    polar_ocean: float = 5.5        # taper strength, in std devs of the field
-    polar_wobble: float = 0.13      # how far the ice line wanders, in latitude
+    polar_start: float = 0.56       # kept so older configs load; geology ignores it
+    polar_ocean: float = 0.0        # kept so older configs load; geology ignores it
+    polar_wobble: float = 0.13      # kept so older configs load; geology ignores it
     polar_wobble_periods: float = 2.5
     land_fraction: float = 0.29
 

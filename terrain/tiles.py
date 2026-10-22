@@ -1,4 +1,8 @@
-"""Hierarchical tiles sampled from one macro world."""
+"""Hierarchical tiles sampled from one macro world.
+
+Tiles that must match before a neighbor exists are built by terrain.planet_tiles.
+The solver in this file refines a window and is only seamless inside its halo.
+"""
 from dataclasses import dataclass
 
 import numpy as np

@@ -1,10 +1,10 @@
-"""Grid helpers. The world wraps in x (cylinder) and clamps in y (poles)."""
+"""Grid helpers. Longitude wraps. Parallels shorten toward the poles."""
 import threading
 from contextlib import contextmanager
 
 import numpy as np
 from scipy import fft as _fft
-from scipy.ndimage import distance_transform_edt, gaussian_filter, label as ndi_label
+from scipy.ndimage import gaussian_filter, label as ndi_label
 
 NEIGH8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 DIST8 = [np.sqrt(2), 1.0, np.sqrt(2), 1.0, 1.0, np.sqrt(2), 1.0, np.sqrt(2)]
@@ -156,6 +156,75 @@ def latitude(shape):
     return (np.arange(h) / max(1, h - 1) * 2.0 - 1.0)[:, None]
 
 
+def latitude_rad(shape):
+    """Latitude of each row's centre, in radians. The pole row is not exactly ±π/2."""
+    h = shape[0]
+    return ((np.arange(h) + 0.5) / max(h, 1) * np.pi - np.pi / 2.0)[:, None]
+
+
+def cos_latitude(shape):
+    """How much a parallel shrinks. 1 at the equator, small near the poles."""
+    return np.cos(latitude_rad(shape))
+
+
+# Raster steps use this floor so a pole row is not a few metres wide.
+# Sea level uses the true area below, with no floor.
+METRIC_COS_FLOOR = 0.2
+
+
+def metric_cos(shape):
+    """Parallel scale for slopes and neighbour steps."""
+    return np.maximum(cos_latitude(shape), METRIC_COS_FLOOR)
+
+
+def sphere_xyz(shape):
+    """Unit-sphere coordinates of each cell centre. Row 0 is the south pole."""
+    h, w = shape
+    phi = latitude_rad(shape)[:, 0]
+    lam = (np.arange(w) + 0.5) / max(w, 1) * (2.0 * np.pi) - np.pi
+    cos_phi = np.cos(phi)
+    x = cos_phi[:, None] * np.cos(lam)[None, :]
+    y = cos_phi[:, None] * np.sin(lam)[None, :]
+    z = np.broadcast_to(np.sin(phi)[:, None], (h, w)).copy()
+    return x, y, z
+
+
+def cell_area(shape):
+    """Spherical area of each cell. Every cell in a row shares that parallel's zone."""
+    h = shape[0]
+    edges = np.linspace(-np.pi / 2.0, np.pi / 2.0, h + 1)
+    row = np.sin(edges[1:]) - np.sin(edges[:-1])
+    return row[:, None].astype(np.float64)
+
+
+def area_quantile(values, fraction):
+    """Value at which `fraction` of the spherical area lies at or below it."""
+    field = np.asarray(values, np.float64)
+    weights = np.broadcast_to(cell_area(field.shape), field.shape).ravel()
+    flat = field.ravel()
+    order = np.argsort(flat, kind="stable")
+    cumulative = np.cumsum(weights[order])
+    target = float(np.clip(fraction, 0.0, 1.0)) * float(cumulative[-1])
+    index = min(int(np.searchsorted(cumulative, target, side="left")), flat.size - 1)
+    return float(flat[order][index])
+
+
+def step_lengths(shape):
+    """Physical length of each 8-neighbour step, in equatorial-cell units.
+
+    A north-south step stays one cell. An east-west step shrinks with cos(latitude).
+    """
+    cos = metric_cos(shape)
+    lengths = []
+    for dy, dx in NEIGH8:
+        if dy == 0:
+            scale = cos
+        else:
+            scale = 0.5 * (cos + shift(cos, dy, 0))
+        lengths.append(np.hypot(abs(dy), abs(dx) * scale))
+    return lengths
+
+
 def gradient(a):
     """Central-difference (dy, dx) with the grid's wrap/clamp conventions."""
     dy = (shift(a, 1, 0) - shift(a, -1, 0)) * 0.5
@@ -187,23 +256,158 @@ def blur(a, sigma):
     return gaussian_filter(a, sigma, mode=["nearest", "wrap"])
 
 
+def _take_row(dest, src, step, dest_sy, dest_sx, src_sy, src_sx):
+    """Write `src + step` into `dest` where it is strictly nearer."""
+    cand = src + step
+    better = cand + 1e-8 < dest
+    if not np.any(better):
+        return False
+    dest[better] = cand[better]
+    if dest_sy is not None:
+        dest_sy[better] = src_sy[better]
+        dest_sx[better] = src_sx[better]
+    return True
+
+
+def _sweep_row(row, step, sy, sx, wrap):
+    """Spread one row along its parallel, including the longitude seam."""
+    changed = False
+    s = float(step)
+    width = row.size
+    eps = 1e-8
+    for x in range(1, width):
+        cand = row[x - 1] + s
+        if cand + eps < row[x]:
+            row[x] = cand
+            if sy is not None:
+                sy[x] = sy[x - 1]
+                sx[x] = sx[x - 1]
+            changed = True
+    for x in range(width - 2, -1, -1):
+        cand = row[x + 1] + s
+        if cand + eps < row[x]:
+            row[x] = cand
+            if sy is not None:
+                sy[x] = sy[x + 1]
+                sx[x] = sx[x + 1]
+            changed = True
+    if not wrap or width < 2:
+        return changed
+    left_v, right_v = float(row[0]), float(row[-1])
+    if sy is not None:
+        left_sy, left_sx = sy[0], sx[0]
+        right_sy, right_sx = sy[-1], sx[-1]
+    carry, csy, csx = right_v + s, (right_sy if sy is not None else 0), (right_sx if sy is not None else 0)
+    for x in range(width):
+        if carry + eps < row[x]:
+            row[x] = carry
+            if sy is not None:
+                sy[x] = csy
+                sx[x] = csx
+            changed = True
+            carry += s
+        else:
+            break
+    carry, csy, csx = left_v + s, (left_sy if sy is not None else 0), (left_sx if sy is not None else 0)
+    for x in range(width - 1, -1, -1):
+        if carry + eps < row[x]:
+            row[x] = carry
+            if sy is not None:
+                sy[x] = csy
+                sx[x] = csx
+            changed = True
+            carry += s
+        else:
+            break
+    return changed
+
+
 def edt(mask, return_indices=False):
-    """Distance to the nearest False cell of `mask`, wrapping in x."""
+    """Distance to the nearest False cell, wrapping in x.
+
+    East-west steps use the parallel's length, so the same pixel gap is shorter
+    near the poles. One downward pass and one upward pass cover the map; the
+    distance is not walked a cell at a time.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    h, w = mask.shape
     if not np.any(~mask):
         dist = np.full(mask.shape, np.inf, dtype=np.float64)
         if return_indices:
             return dist, (np.full(mask.shape, -1, dtype=np.intp),
                           np.full(mask.shape, -1, dtype=np.intp))
         return dist
-    w = mask.shape[1]
-    p = (w + 1) // 2
-    tiled = np.concatenate([mask[:, -p:], mask, mask[:, :p]], axis=1)
-    if not return_indices:
-        return distance_transform_edt(tiled)[:, p:p + w]
-    dist, idx = distance_transform_edt(tiled, return_indices=True)
-    iy = idx[0][:, p:p + w]
-    ix = (idx[1][:, p:p + w] - p) % w
-    return dist[:, p:p + w], (iy, ix)
+    dist = np.where(mask, np.float64(1e6), np.float64(0.0))
+    sy = sx = None
+    if return_indices:
+        rows = np.arange(h)[:, None]
+        cols = np.arange(w)[None, :]
+        sy = np.where(mask, np.intp(-1), rows).astype(np.intp, copy=True)
+        sx = np.where(mask, np.intp(-1), cols).astype(np.intp, copy=True)
+    steps = step_lengths(mask.shape)
+    east = steps[4]
+    bounds = active_bounds()
+    wrap = bounds is None or not bounds.clamp_x
+
+    def pull(y, other, straight, diag_w, diag_e):
+        changed = _take_row(
+            dist[y], dist[other], float(steps[straight][y, 0]),
+            None if sy is None else sy[y], None if sx is None else sx[y],
+            None if sy is None else sy[other], None if sx is None else sx[other])
+        src = dist[other]
+        src_sy = None if sy is None else sy[other]
+        src_sx = None if sx is None else sx[other]
+        if wrap:
+            west, east_n = np.roll(src, 1), np.roll(src, -1)
+            if sy is not None:
+                west_sy, west_sx = np.roll(src_sy, 1), np.roll(src_sx, 1)
+                east_sy, east_sx = np.roll(src_sy, -1), np.roll(src_sx, -1)
+        else:
+            west = np.empty_like(src)
+            east_n = np.empty_like(src)
+            west[0] = np.inf
+            west[1:] = src[:-1]
+            east_n[-1] = np.inf
+            east_n[:-1] = src[1:]
+            if sy is not None:
+                west_sy = np.empty_like(src_sy)
+                west_sx = np.empty_like(src_sx)
+                east_sy = np.empty_like(src_sy)
+                east_sx = np.empty_like(src_sx)
+                west_sy[1:] = src_sy[:-1]
+                west_sx[1:] = src_sx[:-1]
+                east_sy[:-1] = src_sy[1:]
+                east_sx[:-1] = src_sx[1:]
+        changed |= _take_row(
+            dist[y], west, float(steps[diag_w][y, 0]),
+            None if sy is None else sy[y], None if sx is None else sx[y],
+            None if sy is None else west_sy, None if sx is None else west_sx)
+        changed |= _take_row(
+            dist[y], east_n, float(steps[diag_e][y, 0]),
+            None if sy is None else sy[y], None if sx is None else sx[y],
+            None if sy is None else east_sy, None if sx is None else east_sx)
+        return changed
+
+    for _ in range(4):
+        changed = False
+        for y in range(h):
+            if y > 0:
+                changed |= pull(y, y - 1, 1, 0, 2)
+            changed |= _sweep_row(dist[y], east[y, 0],
+                                  None if sy is None else sy[y],
+                                  None if sx is None else sx[y], wrap)
+        for y in range(h - 1, -1, -1):
+            if y + 1 < h:
+                changed |= pull(y, y + 1, 6, 5, 7)
+            changed |= _sweep_row(dist[y], east[y, 0],
+                                  None if sy is None else sy[y],
+                                  None if sx is None else sx[y], wrap)
+        if not changed:
+            break
+    dist = np.where(dist >= 1e6, np.inf, dist)
+    if return_indices:
+        return dist, (sy, sx)
+    return dist
 
 
 def label_wrap_x(mask, connectivity=8):

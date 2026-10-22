@@ -21,7 +21,7 @@ def thermal(h, iters=30, talus=0.035, rate=0.35, mask=None, pin=None):
     for _ in range(iters):
         delta[:] = 0.0
         around.load(h)
-        for (dy, dx), dist in zip(grid.NEIGH8, grid.DIST8):
+        for (dy, dx), dist in zip(grid.NEIGH8, grid.step_lengths(h.shape)):
             np.subtract(h, around.at(dy, dx), out=give)
             np.subtract(give, talus * dist, out=give)
             np.clip(give, 0, None, out=give)
@@ -200,13 +200,14 @@ def flow_routing(filled):
     slope = np.empty_like(filled)
     bounds = grid.active_bounds()
     here = np.arange(h * w).reshape(h, w) if bounds is not None and bounds.clamp_x else None
-    for (dy, dx), dist in zip(grid.NEIGH8, grid.DIST8):
+    lengths = grid.step_lengths(filled.shape)
+    for (dy, dx), dist in zip(grid.NEIGH8, lengths):
         np.subtract(filled, around.at(dy, dx), out=slope)
         np.divide(slope, dist, out=slope)
         take = slope > best
         best[take] = slope[take]
         rec[take] = grid.neighbour_index(filled.shape, dy, dx)[take]
-        rec_d[take] = dist
+        rec_d[take] = np.broadcast_to(dist, filled.shape)[take]
         if here is not None and dx != 0:
             hit = take[:, :1] if dx < 0 else take[:, -1:]
             if dx < 0:
@@ -303,7 +304,7 @@ def sediment_transport(bedrock, sediment, hardness, discharge=None, iters=8,
             surface = bedrock + sediment
             best = np.zeros((height, width), np.float32)
             receiver = index.copy()
-            for (dy, dx), dist in zip(grid.NEIGH8, grid.DIST8):
+            for (dy, dx), dist in zip(grid.NEIGH8, grid.step_lengths(bedrock.shape)):
                 neighbour = grid.shift(surface, dy, dx)
                 neighbour_i = grid.shift(index, dy, dx)
                 drop = (surface - neighbour) / np.float32(dist)
@@ -509,6 +510,7 @@ def weather_bedrock(bedrock, sediment, erodability, rate=0.002):
         raise ValueError("erodability must match the height field")
     surface = bedrock + sediment
     dy, dx = grid.gradient(surface)
+    dx = dx / grid.metric_cos(surface.shape)
     exposure = np.clip(np.hypot(dy, dx) / np.float32(0.25), 0.0, 1.0)
     produced = (np.float32(rate) * soft
                 * (np.float32(0.2) + np.float32(0.8) * exposure))
@@ -540,7 +542,7 @@ def slump_debris(bedrock, sediment, repose=0.70, rate=0.35, iters=4, wrap_x=True
             around.load(surface)
             cap = sediment * np.float32(0.125)
             moved = False
-            for (dy, dx), dist in zip(grid.NEIGH8, grid.DIST8):
+            for (dy, dx), dist in zip(grid.NEIGH8, grid.step_lengths(sediment.shape)):
                 np.subtract(surface, around.at(dy, dx), out=give)
                 np.divide(give, np.float32(dist), out=give)
                 np.subtract(give, limit, out=give)
@@ -749,7 +751,7 @@ def accumulate_mfd(height, weights=None, p=1.5):
     around = grid.Halo(height.shape, np.float32).load(height)
     slopes = []
     dests = []
-    for (dy, dx), dist in zip(grid.NEIGH8, grid.DIST8):
+    for (dy, dx), dist in zip(grid.NEIGH8, grid.step_lengths(height.shape)):
         drop = (height - around.at(dy, dx)) / np.float32(dist)
         slopes.append(np.power(np.clip(drop, 0.0, None), np.float32(p)))
         dests.append(grid.neighbour_index(height.shape, dy, dx))
@@ -854,6 +856,7 @@ def deposit_sediment(height, discharge, seed, iters=8, wrap_x=True,
             0.05, 1.0).astype(np.float32)
     resistance = (1.0 - erodability).astype(np.float32)
     dy, dx = grid.gradient(height)
+    dx = dx / grid.metric_cos(height.shape)
     grade = np.hypot(dy, dx)
     mantle = (0.002 + 0.02 * np.exp(-grade * 40.0)).astype(np.float32)
     bedrock, sediment = weather_bedrock(

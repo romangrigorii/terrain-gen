@@ -3,6 +3,7 @@ import importlib
 import json
 import queue
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -64,7 +65,7 @@ def test_preset_button_resets_main_sliders(monkeypatch):
     studio.preset_dirty = False
     studio.cycle_option("preset")
     assert studio.preset == "archipelago"
-    assert studio.land.value == 18
+    assert studio.land.value == 15
     assert studio.preset_dirty
 
 
@@ -266,3 +267,181 @@ def test_stitch_atlas_joins_generated_tiles(monkeypatch):
     assert height.shape == (4, 9)
     assert height[1, 0] == 1 and height[1, -1] == 4
     assert out_mask[1, 0, 3] == 255 and out_color[1, -1, 1] == 30
+
+
+def _preview_studio(gui):
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.busy = True
+    studio.job = "preview"
+    studio.painting = None
+    studio.seed_text = "3"
+    studio.atlas = {}
+    studio.tx = 1
+    studio.ty = 2
+    studio._preview_cancel = threading.Event()
+    return studio
+
+
+def test_panning_onto_an_empty_tile_does_not_generate(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.busy = False
+    studio.atlas = {(0, 0): {}}
+    studio.image_name = ""
+    studio.tx, studio.ty = 0, 0
+    studio._cell_under_center = lambda: (1, 0)
+    started = []
+    studio.start = lambda: started.append(True)
+    studio._release_map()
+    assert started == []
+    assert (studio.tx, studio.ty) == (1, 0)
+    assert studio._seed_from == (0, 0)
+    assert "Generate preview" in studio.status
+
+
+def test_panning_onto_a_built_tile_shows_it(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.busy = False
+    studio.atlas = {(0, 0): {}, (1, 0): {}}
+    studio.image_name = "world"
+    studio.tx, studio.ty = 0, 0
+    studio._cell_under_center = lambda: (1, 0)
+    shown = []
+    started = []
+    studio._show_cell = lambda tx, ty, fit=False: shown.append((tx, ty, fit))
+    studio.start = lambda: started.append(True)
+    studio._release_map()
+    assert shown == [(1, 0, False)]
+    assert started == []
+
+
+def test_arrow_to_an_empty_tile_does_not_generate(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.busy = False
+    studio.atlas = {(0, 0): {}}
+    studio.tx, studio.ty = 0, 0
+    studio.fit = lambda: None
+    started = []
+    studio.start = lambda: started.append(True)
+    studio._step(1, 0)
+    assert started == []
+    assert (studio.tx, studio.ty) == (1, 0)
+    assert "Generate preview" in studio.status
+
+
+def _running_preview(gui):
+    studio = _preview_studio(gui)
+    studio._preview_token = 4
+    studio._generate_rest = [(2, 2)]
+    studio._inflight_sculpt = ((1, 2), ())
+    studio.live_surface = "partial"
+    studio.live_cell = (1, 2)
+    studio.progress = gui.Progress()
+    studio.progress.begin("Generating preview", (("plates", 1),))
+    studio.export_btn = types.SimpleNamespace(enabled=False)
+    studio.world = None
+    studio.image_name = "world"
+    studio._cell_under_center = lambda: None
+    kept = {"world": object()}
+    studio.atlas = {(0, 0): kept}
+    return studio, kept
+
+
+def test_cancel_stops_a_preview_and_keeps_finished_tiles(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio, kept = _running_preview(gui)
+    launched = []
+    studio._launch = lambda cell, keep=False: launched.append(cell)
+    studio.cancel_preview()
+    assert studio._preview_cancel.is_set()
+    assert studio._preview_token == 5
+    assert not studio.busy
+    assert studio.job is None
+    assert launched == []
+    assert studio.atlas == {(0, 0): kept}
+    assert studio._generate_rest == []
+    assert studio.live_surface is None
+    assert "Pan to a tile" in studio.status
+
+
+def test_after_cancel_a_new_tile_can_be_generated(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio, kept = _running_preview(gui)
+    studio.cancel_preview()
+    studio._cell_under_center = lambda: (1, 0)
+    studio._release_map()
+    assert (studio.tx, studio.ty) == (1, 0)
+    launched = []
+    studio._launch = lambda cell, keep=False: launched.append(cell)
+    studio.seed_text = "3"
+    studio.painting = None
+    studio._strokes_baked = lambda cell: True
+    studio.start()
+    assert launched == [(1, 0)]
+    assert studio.atlas[(0, 0)] is kept
+
+
+def test_start_does_not_restart_a_running_preview(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = _preview_studio(gui)
+    studio.seed_text = "nope"
+    launched = []
+    studio._launch = lambda cell, keep=False: launched.append(cell)
+    studio.start()
+    assert not studio._preview_cancel.is_set()
+    assert launched == []
+    assert studio.busy
+
+
+def test_cancel_does_not_stop_an_export(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = _preview_studio(gui)
+    studio.job = "export"
+    studio.cancel_preview()
+    assert not studio._preview_cancel.is_set()
+    assert studio.busy
+    assert studio.job == "export"
+
+
+def test_cancelled_preview_posts_no_result(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.events = queue.Queue()
+    settings = dict(preset="archipelago", seed=8, n_plates=6,
+                    land_fraction=0.18, temp_offset=0.,
+                    erosion_model="none", wind_mode="belts",
+                    depression_method="iterative", noise_backend="numpy",
+                    detail_level="off", advanced_export=False)
+    cfg = gui.config_from_settings(settings, 32, 24)
+    cancel = threading.Event()
+    cancel.set()
+    studio._worker(cfg, None, settings, (0, 0), None, 1, cancel)
+    assert studio.events.empty()
+
+
+def test_a_replaced_preview_cannot_finish_over_the_new_one(monkeypatch):
+    gui = _mock_gui(monkeypatch)
+    studio = gui.Studio.__new__(gui.Studio)
+    studio.events = queue.Queue()
+    studio.job = "preview"
+    studio.busy = True
+    studio.tx, studio.ty = 0, 0
+    studio.atlas = {}
+    studio._preview_token = 2
+    studio.progress = gui.Progress()
+    studio.progress.begin("Generating preview", (("plates", 1),))
+    studio.status = "generating"
+    studio.live_surface = "current"
+    studio.events.put(("stage", "plates", 1))
+    studio.events.put(("cell_image", (0, 0), "stale", 1))
+    studio.events.put(("error", "generation failed: boom", 1))
+    studio.events.put(("done", None, None, None, (0, 0), 1))
+    studio.events.put(("stage", "relief", 2))
+    studio.pump()
+    assert studio.busy
+    assert studio.job == "preview"
+    assert studio.atlas == {}
+    assert studio.live_surface == "current"
+    assert studio.status == "relief"
