@@ -762,11 +762,12 @@ class Studio:
         self.clear_paint_btn = Button("Clear", 64)
         self.view3d_btn = Button("3D", 52)
         self.view3d = False
-        self.orbit = [0.55, 0.78, 1.2]
+        self.orbit = [0.55, 0.78, 1.0]
         self.look = [0.5, 0.5]
         self.pan_drag = None
         self.orbit_drag = None
         self._view3d_cache = None
+        self._live3d = None
         self._sheet_layout = None
         self._stroke_cell = None
         self.strokes = {}
@@ -919,10 +920,10 @@ class Studio:
         self.orbit_drag = None
         if self.view3d:
             self.image_name = "world"
-            self.status = ("3D view of every generated tile. "
+            self.status = ("Live 3D of every generated tile. "
                            "Left-drag pans, right-drag rotates, scroll zooms.")
         else:
-            self.status = "Map view. D loads the rendered surface in 3D."
+            self.status = "Map view. D loads the live 3D surface."
 
     def start(self):
         if self.busy:
@@ -1753,6 +1754,18 @@ class Studio:
             parts.append((tx, ty, id(world.height), id(made["world"])))
         return tuple(sorted(parts))
 
+    def _world_width_m(self):
+        """Ground width of one tile. The 3D view uses it so height matches the map."""
+        for tile in self.atlas.values():
+            world = tile.get("world")
+            cfg = getattr(world, "cfg", None)
+            if cfg is None:
+                continue
+            width = float(getattr(cfg, "world_width_m", 0.0))
+            if math.isfinite(width) and width > 0:
+                return width
+        return 200_000.0
+
     def _terrain_sheet(self):
         """Height, color, and mask for every generated tile, sharing rims."""
         tiles = []
@@ -1764,14 +1777,34 @@ class Studio:
             tiles.append((tx, ty, np.asarray(world.surface, np.float32), made["world"]))
         return stitch_tiles(tiles)
 
-    def _view3d_frame(self):
-        """Cached perspective of every generated tile on one surface."""
+    def _live_renderer(self):
+        """The GPU view, or None when this machine has to use the software one."""
+        if self._live3d is False:
+            return None
+        if self._live3d is None:
+            try:
+                from terrain.live3d import LiveTerrain
+                self._live3d = LiveTerrain()
+            except Exception:
+                self._live3d = False
+                self.status = ("Live 3D is unavailable, so this view stays on the software renderer.")
+                return None
+        return self._live3d
+
+    def _view3d_frame(self, refresh=False):
+        """Perspective of every generated tile. The live view redraws while it is open."""
         tiles = self._sheet_key()
         if not tiles:
             self._sheet_layout = None
             return None
         dest = self._view3d_dest()
         render_w, render_h = dest.w, dest.h
+        live = self._live_renderer()
+        if live is not None:
+            try:
+                return self._live_frame(live, tiles, dest, render_w, render_h, refresh)
+            except Exception as err:
+                self._drop_live(err)
         txs = [tx for tx, _ty, _h, _c in tiles]
         tys = [ty for _tx, ty, _h, _c in tiles]
         span = max(max(txs) - min(txs) + 1, max(tys) - min(tys) + 1)
@@ -1788,12 +1821,52 @@ class Studio:
             height, color, mask, layout = sheet
             rgb, pick_y, pick_x = load_surface(
                 height, color,
-                self.orbit[0], self.orbit[1], self.orbit[2],
+                self.orbit[0], self.orbit[1], self._view_distance((1.0, 1.0)),
                 render_w, render_h, steps=steps, origin=self.look, mask=mask)
             cached = (key, rgb, pick_y, pick_x, layout)
             self._view3d_cache = cached
         self._sheet_layout = cached[4]
         return dest, cached[1], cached[2], cached[3]
+
+    def _drop_live(self, err):
+        live = self._live3d
+        self._live3d = False
+        if live not in (None, False):
+            try:
+                live.close()
+            except Exception:
+                pass
+        self.status = f"Live 3D stopped ({err}). Showing the software view."
+
+    def _live_frame(self, live, tiles, dest, render_w, render_h, refresh):
+        camera = (round(self.orbit[0], 3), round(self.orbit[1], 3), round(self.orbit[2], 3),
+                  round(self.look[0], 4), round(self.look[1], 4), render_w, render_h)
+        if live.sheet_key != tiles:
+            sheet = self._terrain_sheet()
+            if sheet is None:
+                self._sheet_layout = None
+                return None
+            height, color, mask, layout = sheet
+            live.set_sheet(height, color, mask, layout, tiles, self._world_width_m())
+        if not refresh and live.frame is not None and live.frame_key == camera:
+            self._sheet_layout = live.layout
+            rgb, pick_y, pick_x = live.frame
+            return dest, rgb, pick_y, pick_x
+        rgb, pick_y, pick_x = live.draw(
+            self.orbit[0], self.orbit[1], self._view_distance(live.plane),
+            render_w, render_h, self.look, pygame.time.get_ticks() * 0.001)
+        live.frame_key = camera
+        self._sheet_layout = live.layout
+        self._view3d_cache = (camera, rgb, pick_y, pick_x, live.layout)
+        return dest, rgb, pick_y, pick_x
+
+    def _view_distance(self, plane):
+        """Zoom times the distance that keeps the whole sheet in the picture."""
+        from terrain.live3d import frame_distance
+        dest = self._view3d_dest()
+        fit = frame_distance(
+            self.orbit[0], self.orbit[1], plane, dest.w, dest.h)
+        return fit * float(self.orbit[2])
 
     def _sheet_to_tile(self, y, x):
         """Sheet pick in 0..1 to `(tx, ty, local_y, local_x)` on a real tile."""
@@ -1842,7 +1915,7 @@ class Studio:
         return self._sheet_to_tile(y, x)
 
     def _draw_view3d(self):
-        frame = self._view3d_frame()
+        frame = self._view3d_frame(refresh=True)
         if frame is None:
             return
         dest, rgb, pick_y, pick_x = frame
@@ -2139,8 +2212,13 @@ class Studio:
         self.screen.set_clip(None)
         if not showing_3d:
             self._draw_paint()
-        label = self.big.render("surface" if showing_3d else (self.image_name or "preview"),
-                                True, (255, 226, 150))
+        if showing_3d and self._live3d not in (None, False):
+            title = "live 3D"
+        elif showing_3d:
+            title = "surface"
+        else:
+            title = self.image_name or "preview"
+        label = self.big.render(title, True, (255, 226, 150))
         self.screen.blit(label, (self.view.x + 12, self.view.y + 10))
         if showing_3d:
             note = "All generated tiles. Left-drag pans, right-drag rotates, scroll zooms."
@@ -2490,9 +2568,13 @@ class Studio:
                         origin, look_x, look_z = self.pan_drag
                         dest = self._view3d_dest()
                         shift_x, shift_z = pan_delta(
-                            self.orbit[0], self.orbit[1], self.orbit[2],
+                            self.orbit[0], self.orbit[1], self._view_distance(
+                                self._live3d.plane if self._live3d not in (None, False)
+                                else (1.0, 1.0)),
                             event.pos[0] - origin[0], event.pos[1] - origin[1],
                             dest.w, dest.h)
+                        if self._live3d not in (None, False):
+                            shift_z /= self._live3d.plane[1]
                         self.look[0] = float(np.clip(look_x + shift_x, -0.35, 1.35))
                         self.look[1] = float(np.clip(look_z + shift_z, -0.35, 1.35))
                     elif self.drag and self.image is not None:
