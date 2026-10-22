@@ -1,0 +1,1 @@
+"""Climate and plant stages."""

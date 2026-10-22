@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terrain-world-generator-upgrade"
+version = "0.2.0"
+description = "Modular tectonic world generator, climate, rivers and export layers"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "scipy>=1.11"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pillow>=10"]
+studio = ["pygame>=2.5", "pillow>=10"]
+accel = ["numba>=0.61"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["terrain*"]

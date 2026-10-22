@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Numba
+*.nbi
+*.nbc
+
+# Generated maps, benchmarks, and test output
+out/
+benchmarks/out/
+test_output/
+test-output/
+tmp/
+*.log
+
+# Documents and pictures
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.tif
+*.tiff
+*.bmp
+*.ico
+*.svg
+*.exr
+*.hdr
+*.tga
+*.psd
+
+# Numeric dumps
+*.npy
+*.npz
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
