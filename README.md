@@ -2,6 +2,12 @@
 
 Procedural worlds from plate tectonics. Plates raise the mountains, rain and rivers carve them, climate picks the biomes, and trees grow last. The map wraps east to west and closes with ocean at the poles.
 
+The asset studio, seed 7. The flat world, then the same tiles in the live 3D view.
+
+<img src="media/studio-world.png" alt="Asset studio showing an earthlike world map" width="780">
+
+<img src="media/studio-live-3d.png" alt="Live 3D view of the same generated world" width="780">
+
 ## Install
 
 ```bash

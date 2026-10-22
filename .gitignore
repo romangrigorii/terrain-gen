@@ -30,6 +30,7 @@ latest.json
 
 # Intermediate map renders: height tiles, masks, previews, and debug images
 *.png
+!media/*.png
 zemia_height.png
 zemia_height16.png
 zemia_height16.json
